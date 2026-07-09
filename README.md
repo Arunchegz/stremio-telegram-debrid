@@ -66,6 +66,7 @@ Deploy your own instance of the Telegram Stremio Addon instantly using any of th
 | **Heroku** | Paid / Eco Tier (Stable & Continuous, starts at $5/month) | [![Deploy to Heroku](https://www.herokucdn.com/deploy/button.svg)](https://www.heroku.com/deploy/?template=https://github.com/SunilRoy-dev/stremio-telegram-debrid) |
 | **Railway** | Trial Tier (Limited Credits, approx. 500 hours/month) | [![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/new/template?template=https://github.com/SunilRoy-dev/stremio-telegram-debrid) |
 | **Zeabur** | Trial Tier (Limited Credits) | [![Deploy on Zeabur](https://zeabur.com/button.svg)](https://zeabur.com/templates/deploy?template=https://github.com/SunilRoy-dev/stremio-telegram-debrid) |
+| **Google Colab** | Free Tier (Temporary Runtime — Exposes app via Ngrok tunnel) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/SunilRoy-dev/stremio-telegram-debrid/blob/beta/deployment/colab/deploy_colab.ipynb) |
 
 *Please read the **[Deployment Platform Specs and Limitations](#deployment-platform-specs-and-limitations)** section below before selecting a hosting provider.*
 
@@ -404,6 +405,16 @@ Once the status bar at the top turns green and says **Running**, your addon is o
   - **Google Colab Notebook Deployer**: You can also use our prebuilt Colab notebook to configure and deploy the app directly from your web browser:
     
     [![Deploy via Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/SunilRoy-dev/stremio-telegram-debrid/blob/beta/deployment/colab/deploy_heroku.ipynb)
+
+### 7. Google Colab (Run Addon Temporarily)
+- **Cost**: Free Tier. Requires a free account on [ngrok.com](https://ngrok.com) to get a tunnel token.
+- **Drawbacks**:
+  - **Temporary Runtime Only**: Google Colab containers shut down after a few hours of inactivity or once you close your browser tab. This is not suitable for a 24/7 permanent deployment, but is perfect for testing or temporary streaming.
+- **Setup Guide**:
+  1. Click the **Open In Colab** badge in the table above to open our deployment notebook.
+  2. Run the **Setup** cell to clone the code and install dependencies.
+  3. Fill in your credentials and paste your Ngrok Authtoken in the **Inputs** form.
+  4. Run the **Start Server** cell. Copy the generated public Ngrok URL and paste it into Stremio!
 
 ---
 
