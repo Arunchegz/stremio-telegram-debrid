@@ -1,0 +1,51 @@
+{
+  "name": "Telegram Stremio Addon",
+  "description": "Stream video, audio, and subtitle files directly from Telegram storage inside Stremio.",
+  "repository": "https://github.com/SunilRoy-dev/stremio-telegram-debrid",
+  "logo": "https://raw.githubusercontent.com/SunilRoy-dev/stremio-telegram-debrid/main/stremio_telegram_logo.png",
+  "keywords": [
+    "stremio",
+    "telegram",
+    "proxy",
+    "stream"
+  ],
+  "env": {
+    "API_ID": {
+      "description": "Your Telegram API ID from my.telegram.org",
+      "required": true
+    },
+    "API_HASH": {
+      "description": "Your Telegram API Hash from my.telegram.org",
+      "required": true
+    },
+    "TELEGRAM_CHANNEL_ID": {
+      "description": "Comma-separated list of target channel IDs (e.g. -1001234567890)",
+      "required": true
+    },
+    "USER_SESSION_STRING": {
+      "description": "Pyrogram string session (highly recommended for >2GB files)",
+      "required": false
+    },
+    "BOT_TOKEN": {
+      "description": "Bot token from @BotFather (fallback if USER_SESSION_STRING is not used)",
+      "required": false
+    },
+    "API_KEY": {
+      "description": "Optional key to secure your manifest URL with ?api_key=...",
+      "required": false
+    },
+    "ADDON_URL": {
+      "description": "The URL where this app is deployed (e.g. https://myapp.herokuapp.com)",
+      "required": true
+    },
+    "LOG_CHANNEL_ID": {
+      "description": "Optional Telegram channel ID where play/stream logs are recorded",
+      "required": false
+    }
+  },
+  "buildpacks": [
+    {
+      "url": "heroku/python"
+    }
+  ]
+}

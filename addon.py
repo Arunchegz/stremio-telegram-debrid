@@ -32,7 +32,9 @@ from zip_helper import (
     get_zip_entry_data_offset,
     zip_compressed_generator
 )
+from search_utils import VideoMatcher, parse_video_resolution, get_resolution_score
 import anyio
+
 
 
 logging.basicConfig(
@@ -66,6 +68,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.middleware("http")
+async def disable_proxy_buffering(request: Request, call_next):
+    response = await call_next(request)
+    if "/stream/" in request.url.path:
+        response.headers["X-Accel-Buffering"] = "no"
+    return response
+
 
 def group_tg_messages(messages: list) -> list:
     grouped = {}
@@ -1095,12 +1105,39 @@ async def stream_handler(
         try:
             meta = await get_metadata_from_cinemeta(type, imdb_id)
             movie_name = meta.get("name")
+            year_str = meta.get("year")
+            year = None
+            if year_str:
+                try:
+                    year = int(str(year_str).split("-")[0])
+                except Exception:
+                    pass
             
             if movie_name:
-                logger.info(f"Resolved IMDb {imdb_id} to '{movie_name}'. Searching Telegram...")
-                tg_results = await tg_client_manager.search_messages(query=movie_name, limit=50)
+                matcher = VideoMatcher()
+                if type == "series" and season is not None and episode is not None:
+                    queries = matcher.make_series_search_queries(movie_name, season, episode)
+                else:
+                    queries = matcher.make_movie_search_queries(movie_name, year)
                 
-                grouped_results = group_tg_messages(tg_results)
+                logger.info(f"Resolved IMDb {imdb_id} to '{movie_name}'. Searching Telegram with {len(queries)} safe queries...")
+                
+                # Search target channels for queries in parallel
+                search_tasks = [tg_client_manager.search_messages(query=q, limit=100) for q in queries]
+                search_results_lists = await asyncio.gather(*search_tasks, return_exceptions=True)
+                
+                # Dedup results
+                seen_messages = set()
+                tg_results_flat = []
+                for res_list in search_results_lists:
+                    if isinstance(res_list, list):
+                        for msg in res_list:
+                            if msg and (msg.chat.id, msg.id) not in seen_messages:
+                                seen_messages.add((msg.chat.id, msg.id))
+                                tg_results_flat.append(msg)
+                                
+                grouped_results = group_tg_messages(tg_results_flat)
+                valid_streams = []
                 
                 for item in grouped_results:
                     if isinstance(item, tuple):
@@ -1108,16 +1145,23 @@ async def stream_handler(
                         first_msg = parts[0]
                         media = first_msg.video or first_msg.document or first_msg.audio
                         file_name = getattr(media, "file_name", "") or ""
+                        caption = first_msg.caption or ""
                         
-                        if not matches_title(base_name, movie_name):
-                            continue
-                            
-                        if type == "series" and not matches_episode(file_name, season, episode):
+                        score = matcher.calculate_match_score(
+                            filename=base_name,
+                            caption=caption,
+                            title=movie_name,
+                            year=year,
+                            season=season,
+                            episode=episode
+                        )
+                        if score < matcher.score_threshold:
                             continue
                             
                         total_size = sum((x.video or x.document or x.audio).file_size for x in parts if (x.video or x.document or x.audio))
                         msg_ids = ",".join(str(x.id) for x in parts)
                         chat_id = first_msg.chat.id
+                        resolution = parse_video_resolution(f"{base_name} {caption}")
                         
                         is_zip = False
                         if base_name.lower().endswith(".zip"):
@@ -1127,18 +1171,28 @@ async def stream_handler(
                                 if video_entries:
                                     is_zip = True
                                     for entry in video_entries:
-                                        if type == "series" and not matches_episode(entry.filename, season, episode):
+                                        entry_score = matcher.calculate_match_score(
+                                            filename=entry.filename,
+                                            caption="",
+                                            title=movie_name,
+                                            year=year,
+                                            season=season,
+                                            episode=episode
+                                        )
+                                        if entry_score < matcher.score_threshold:
                                             continue
+                                            
+                                        entry_res = parse_video_resolution(entry.filename)
                                         stream_url = f"{Config.ADDON_URL}/stream/zip/{chat_id}/{msg_ids}/{urllib.parse.quote(entry.filename)}{query_param}"
-                                        subtitles = await find_subtitles_for_video(entry.filename, api_key=api_key, cached_messages=tg_results)
-                                        streams.append({
-                                            "name": "▶ TG ZIP Play (Split)",
+                                        subtitles = await find_subtitles_for_video(entry.filename, api_key=api_key, cached_messages=tg_results_flat)
+                                        valid_streams.append({
+                                            "name": f"▶ TG ZIP Play [{entry_res}]",
                                             "title": f"{entry.filename}\n💾 Stream ZIP entry | 📦 {format_size(entry.file_size)}",
                                             "url": stream_url,
                                             "subtitles": subtitles,
-                                            "behaviorHints": {
-                                                "notWebReady": True,
-                                            }
+                                            "behaviorHints": {"notWebReady": True},
+                                            "_res_score": get_resolution_score(entry_res),
+                                            "_file_size": entry.file_size
                                         })
                             except Exception as e:
                                 logger.error(f"Error checking split ZIP for IMDB: {e}")
@@ -1147,27 +1201,34 @@ async def stream_handler(
                             if not is_video_file(base_name):
                                 continue
                             stream_url = f"{Config.ADDON_URL}/stream/split/{chat_id}/{msg_ids}/{urllib.parse.quote(base_name)}{query_param}"
-                            streams.append({
-                                "name": "▶ TG Play (Split)",
+                            valid_streams.append({
+                                "name": f"▶ TG Play (Split) [{resolution}]",
                                 "title": f"{base_name}\n💾 Stitch stream | 📦 {format_size(total_size)}",
                                 "url": stream_url,
-                                "behaviorHints": {
-                                    "notWebReady": True,
-                                }
+                                "behaviorHints": {"notWebReady": True},
+                                "_res_score": get_resolution_score(resolution),
+                                "_file_size": total_size
                             })
                     else:
                         msg = item
                         media = msg.video or msg.document or msg.audio
                         file_name = getattr(media, "file_name", None) or msg.caption or ""
+                        caption = msg.caption or ""
                         
-                        if not matches_title(file_name, movie_name):
-                            continue
-                            
-                        if type == "series" and not matches_episode(file_name, season, episode):
+                        score = matcher.calculate_match_score(
+                            filename=file_name,
+                            caption=caption,
+                            title=movie_name,
+                            year=year,
+                            season=season,
+                            episode=episode
+                        )
+                        if score < matcher.score_threshold:
                             continue
                             
                         file_size = media.file_size
                         chat_id = msg.chat.id
+                        resolution = parse_video_resolution(f"{file_name} {caption}")
                         
                         is_zip = False
                         if file_name.lower().endswith(".zip"):
@@ -1177,18 +1238,28 @@ async def stream_handler(
                                 if video_entries:
                                     is_zip = True
                                     for entry in video_entries:
-                                        if type == "series" and not matches_episode(entry.filename, season, episode):
+                                        entry_score = matcher.calculate_match_score(
+                                            filename=entry.filename,
+                                            caption="",
+                                            title=movie_name,
+                                            year=year,
+                                            season=season,
+                                            episode=episode
+                                        )
+                                        if entry_score < matcher.score_threshold:
                                             continue
+                                            
+                                        entry_res = parse_video_resolution(entry.filename)
                                         stream_url = f"{Config.ADDON_URL}/stream/zip/{chat_id}/{msg.id}/{urllib.parse.quote(entry.filename)}{query_param}"
-                                        subtitles = await find_subtitles_for_video(entry.filename, api_key=api_key, cached_messages=tg_results)
-                                        streams.append({
-                                            "name": "▶ TG ZIP Play",
+                                        subtitles = await find_subtitles_for_video(entry.filename, api_key=api_key, cached_messages=tg_results_flat)
+                                        valid_streams.append({
+                                            "name": f"▶ TG ZIP Play [{entry_res}]",
                                             "title": f"{entry.filename}\n💾 Stream ZIP entry | 📦 {format_size(entry.file_size)}",
                                             "url": stream_url,
                                             "subtitles": subtitles,
-                                            "behaviorHints": {
-                                                "notWebReady": True,
-                                            }
+                                            "behaviorHints": {"notWebReady": True},
+                                            "_res_score": get_resolution_score(entry_res),
+                                            "_file_size": entry.file_size
                                         })
                             except Exception as e:
                                 logger.error(f"Error checking standalone ZIP for IMDB: {e}")
@@ -1197,17 +1268,25 @@ async def stream_handler(
                             if not is_video_file(file_name):
                                 continue
                             stream_url = f"{Config.ADDON_URL}/stream/file/{chat_id}/{msg.id}/{urllib.parse.quote(file_name)}{query_param}"
-                            subtitles = await find_subtitles_for_video(file_name, api_key=api_key, cached_messages=tg_results)
+                            subtitles = await find_subtitles_for_video(file_name, api_key=api_key, cached_messages=tg_results_flat)
                             
-                            streams.append({
-                                "name": "▶ TG Play",
+                            valid_streams.append({
+                                "name": f"▶ TG Play [{resolution}]",
                                 "title": f"{file_name}\n💾 Telegram File | 📦 {format_size(file_size)}",
                                 "url": stream_url,
                                 "subtitles": subtitles,
-                                "behaviorHints": {
-                                    "notWebReady": True,
-                                }
+                                "behaviorHints": {"notWebReady": True},
+                                "_res_score": get_resolution_score(resolution),
+                                "_file_size": file_size
                             })
+                            
+                # Sort by resolution, then size
+                valid_streams.sort(key=lambda s: (s.get("_res_score", 0), s.get("_file_size", 0)), reverse=True)
+                for s in valid_streams:
+                    s.pop("_res_score", None)
+                    s.pop("_file_size", None)
+                    streams.append(s)
+                    
         except Exception as e:
             logger.error(f"Cinemeta search/resolve failed: {e}")
 
@@ -1372,7 +1451,11 @@ async def tg_stream_proxy(
             chat_id_val = int(chat_id)
         except ValueError:
             chat_id_val = chat_id
-        msg = await tg_client_manager.get_message(message_id, chat_id=chat_id_val)
+        # Get fresh message reference for streaming
+        try:
+            msg = await tg_client_manager.client.get_messages(chat_id=chat_id_val, message_ids=message_id)
+        except Exception:
+            msg = await tg_client_manager.get_message(message_id, chat_id=chat_id_val)
     except Exception as e:
         logger.error(f"Proxy failed to fetch message: {e}")
         raise HTTPException(status_code=404, detail="Media file not found")
@@ -1413,13 +1496,19 @@ async def tg_stream_proxy(
     skip_bytes = start % chunk_size
     
     headers = {
-        "Content-Range": f"bytes {start}-{end}/{file_size}",
         "Accept-Ranges": "bytes",
         "Content-Length": str(content_length),
         "Content-Disposition": f'inline; filename="{filename}"',
+        "Connection": "keep-alive",
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
     }
     
-    status_code = 206 if range_header else 200
+    # Content-Range must only be sent on 206
+    status_code = 200
+    if range_header:
+        status_code = 206
+        headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
     
     if request.method == "HEAD":
         logger.info(f"HEAD request for media '{filename}' (bytes {start}-{end}/{file_size}) - Status {status_code}")
@@ -1430,28 +1519,56 @@ async def tg_stream_proxy(
         )
         
     async def file_generator():
+        nonlocal msg
         bytes_sent = 0
         bytes_to_skip = skip_bytes
-        try:
-            async for chunk in tg_client_manager.client.stream_media(media, offset=offset):
-                if bytes_to_skip > 0:
-                    if bytes_to_skip < len(chunk):
-                        chunk = chunk[bytes_to_skip:]
-                        bytes_to_skip = 0
-                    else:
-                        bytes_to_skip -= len(chunk)
-                        continue
+        retry_count = 0
+        max_retries = 2
+        current_offset = offset
+        
+        while retry_count <= max_retries:
+            try:
+                # Stream using message object
+                async for chunk in tg_client_manager.client.stream_media(msg, offset=current_offset):
+                    if bytes_to_skip > 0:
+                        if bytes_to_skip < len(chunk):
+                            chunk = chunk[bytes_to_skip:]
+                            bytes_to_skip = 0
+                        else:
+                            bytes_to_skip -= len(chunk)
+                            continue
+                            
+                    if bytes_sent + len(chunk) > content_length:
+                        chunk = chunk[:content_length - bytes_sent]
                         
-                if bytes_sent + len(chunk) > content_length:
-                    chunk = chunk[:content_length - bytes_sent]
+                    yield chunk
+                    bytes_sent += len(chunk)
                     
-                yield chunk
-                bytes_sent += len(chunk)
-                
-                if bytes_sent >= content_length:
+                    if bytes_sent >= content_length:
+                        break
+                # Stream completed successfully
+                break
+            except asyncio.CancelledError:
+                logger.info(f"Streaming cancelled by client for message {message_id}")
+                break
+            except Exception as e:
+                err_str = str(e).upper()
+                is_expired = "FILEREFERENCEEXPIRED" in type(e).__name__.upper() or "FILE_REFERENCE" in err_str
+                if is_expired and retry_count < max_retries:
+                    retry_count += 1
+                    logger.warning(f"File reference expired for message {message_id}, refreshing and retrying ({retry_count}/{max_retries})")
+                    try:
+                        msg = await tg_client_manager.client.get_messages(chat_id=chat_id_val, message_ids=message_id)
+                        total_bytes_streamed = start + bytes_sent
+                        current_offset = total_bytes_streamed // chunk_size
+                        bytes_to_skip = total_bytes_streamed % chunk_size
+                        continue
+                    except Exception as refresh_err:
+                        logger.error(f"Failed to refresh message for reference recovery: {refresh_err}")
+                        break
+                else:
+                    logger.error(f"Streaming error on message {message_id}: {e}")
                     break
-        except Exception as e:
-            logger.error(f"Streaming error on message {message_id}: {e}")
             
     logger.info(f"Streaming media '{filename}' (bytes {start}-{end}/{file_size}) - Status {status_code}")
     
@@ -1492,7 +1609,12 @@ async def tg_split_stream_proxy(
     
     for msg_id in msg_id_list:
         try:
-            msg = await tg_client_manager.get_message(msg_id, chat_id=chat_id_val)
+            # Get fresh message reference for streaming
+            try:
+                msg = await tg_client_manager.client.get_messages(chat_id=chat_id_val, message_ids=msg_id)
+            except Exception:
+                msg = await tg_client_manager.get_message(msg_id, chat_id=chat_id_val)
+                
             if not msg:
                 raise HTTPException(status_code=404, detail=f"Message {msg_id} not found")
             media = msg.video or msg.document or msg.audio
@@ -1500,12 +1622,15 @@ async def tg_split_stream_proxy(
                 raise HTTPException(status_code=400, detail=f"No media in message {msg_id}")
                 
             chunks_info.append({
+                "msg": msg,
                 "media": media,
                 "size": media.file_size,
                 "start_byte": total_size,
                 "end_byte": total_size + media.file_size - 1
             })
             total_size += media.file_size
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Error fetching metadata for msg {msg_id}: {e}")
             raise HTTPException(status_code=500, detail="Failed resolving split file metadata")
@@ -1528,13 +1653,18 @@ async def tg_split_stream_proxy(
     mime_type = chunks_info[0]["media"].mime_type or "video/mp4"
     
     headers = {
-        "Content-Range": f"bytes {start}-{end}/{total_size}",
         "Accept-Ranges": "bytes",
         "Content-Length": str(content_length),
         "Content-Disposition": f'inline; filename="{filename}"',
+        "Connection": "keep-alive",
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
     }
     
-    status_code = 206 if range_header else 200
+    status_code = 200
+    if range_header:
+        status_code = 206
+        headers["Content-Range"] = f"bytes {start}-{end}/{total_size}"
     
     if request.method == "HEAD":
         return Response(
@@ -1566,7 +1696,8 @@ async def tg_split_stream_proxy(
             bytes_to_skip = skip_bytes
             
             try:
-                async for block in tg_client_manager.client.stream_media(chunk["media"], offset=offset_blocks):
+                # Stream using message object
+                async for block in tg_client_manager.client.stream_media(chunk["msg"], offset=offset_blocks):
                     if bytes_to_skip > 0:
                         if bytes_to_skip < len(block):
                             block = block[bytes_to_skip:]
@@ -1627,7 +1758,11 @@ async def tg_zip_stream_proxy(
         
     messages = []
     for msg_id in msg_id_list:
-        msg = await tg_client_manager.get_message(msg_id, chat_id=chat_id_val)
+        # Get fresh message reference for streaming
+        try:
+            msg = await tg_client_manager.client.get_messages(chat_id=chat_id_val, message_ids=msg_id)
+        except Exception:
+            msg = await tg_client_manager.get_message(msg_id, chat_id=chat_id_val)
         if msg:
             messages.append(msg)
             
@@ -1671,13 +1806,18 @@ async def tg_zip_stream_proxy(
     content_length = end - start + 1
     
     headers = {
-        "Content-Range": f"bytes {start}-{end}/{file_size}",
         "Accept-Ranges": "bytes",
         "Content-Length": str(content_length),
         "Content-Disposition": f'inline; filename="{filename}"',
+        "Connection": "keep-alive",
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
     }
     
-    status_code = 206 if range_header else 200
+    status_code = 200
+    if range_header:
+        status_code = 206
+        headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
     
     if request.method == "HEAD":
         return Response(
@@ -1701,6 +1841,7 @@ async def tg_zip_stream_proxy(
         
         for part in reader.parts:
             chunks_info.append({
+                "message": part["message"],
                 "media": part["media"],
                 "size": part["size"],
                 "start_byte": part["start"],
@@ -1731,7 +1872,8 @@ async def tg_zip_stream_proxy(
                 bytes_to_skip = skip_bytes
                 
                 try:
-                    async for block in tg_client_manager.client.stream_media(chunk["media"], offset=offset_blocks):
+                    # Stream using message object
+                    async for block in tg_client_manager.client.stream_media(chunk["message"], offset=offset_blocks):
                         if bytes_to_skip > 0:
                             if bytes_to_skip < len(block):
                                 block = block[bytes_to_skip:]
@@ -1775,4 +1917,4 @@ async def tg_zip_stream_proxy(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("addon:app", host="0.0.0.0", port=Config.PORT, reload=True)
+    uvicorn.run("addon:app", host="0.0.0.0", port=Config.PORT, reload=True, timeout_keep_alive=300)
