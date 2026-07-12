@@ -38,8 +38,8 @@ Here is a simplified step-by-step roadmap to get the addon running on your phone
 | **1. Fork the Project** | Click **Fork** at the top of this GitHub repository to copy it to your own GitHub account. | GitHub (this webpage) |
 | **2. Get Keys** | Go to [my.telegram.org](https://my.telegram.org) and generate your 'API_ID' and 'API_HASH' keys (see [Setup Help](#1-how-to-get-telegram-api-id--api-hash)). | Telegram Website |
 | **3. Get Session** | Run the Python script on [Computer](#how-to-generate-user_session_string-locally) or [Mobile](#how-to-generate-user_session_string-on-mobile-no-computer-needed) to get your 'USER_SESSION_STRING'. | Local computer or Mobile Phone |
-| **4. Deploy** | Create a free account on Hugging Face and launch a Docker Space (see the [Hugging Face Space Setup Guide](#hugging-face-spaces-setup-guide)). Enter your variables in the Space settings (see [Channel Setup Help](#2-how-to-set-up-your-private-channel--find-its-id) and [Configuring Channels Guide](#configuring-telegram-channels)). | Hugging Face Website |
-| **5. Install** | Copy the manifest URL of your deployed Space and paste it into the 'Add-ons' section of Stremio (see the [Stremio Installation Guide](#how-to-install-in-stremio)). | Stremio App |
+| **4. Deploy** | Choose a hosting platform (e.g., Koyeb, Render, Railway, or Hugging Face) and deploy the addon (see [Deployment Options](#one-click-deploy--setup-options)). Enter your environment variables in the settings. | Hosting Provider |
+| **5. Install** | Copy the manifest URL of your deployed app and paste it into the 'Add-ons' section of Stremio (see the [Stremio Installation Guide](#how-to-install-in-stremio)). | Stremio App |
 
 ### Setup Helpers:
 * **How to get Telegram API Keys**:
@@ -60,7 +60,7 @@ Deploy your own instance of the Telegram Stremio Addon instantly using any of th
 
 | Platform | Deployment Type / Limitations | Deploy Button |
 | :--- | :--- | :--- |
-| **Hugging Face Spaces** | Free CPU Tier (Highly Recommended — Generous Bandwidth / Sleeps after 48h) | [Manual Setup Guide](#hugging-face-spaces-setup-guide) |
+| **Hugging Face Spaces** | Paid/PRO Tier (Docker Spaces are no longer available on the Free Tier — Requires a PRO subscription) | [Manual Setup Guide](#hugging-face-spaces-setup-guide) |
 | **Render** | Free Hobby Tier (5GB Bandwidth Limit & Auto-Sleeps) | [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/SunilRoy-dev/stremio-telegram-debrid) |
 | **Koyeb** | Free Edge Tier (Continuous — Requires Card Verification) | [![Deploy to Koyeb](https://www.koyeb.com/static/images/deploy/button.svg)](https://app.koyeb.com/deploy?type=git&repository=github.com/SunilRoy-dev/stremio-telegram-debrid&branch=main&name=stremio-telegram-debrid) |
 | **Heroku** | Paid / Eco Tier (Stable & Continuous, starts at $5/month) | [![Deploy to Heroku](https://www.herokucdn.com/deploy/button.svg)](https://www.heroku.com/deploy/?template=https://github.com/SunilRoy-dev/stremio-telegram-debrid) |
@@ -325,15 +325,18 @@ Try to limit the configuration to **5 to 10 channels max**. The addon queries ch
 
 Read these limitations carefully to choose the hosting platform that best fits your requirements:
 
-### 1. Hugging Face Spaces
+### 1. Hugging Face Spaces (Paid Docker Tier)
 
-Hugging Face Spaces is the recommended hosting platform as it provides fast networking, stable CPU environments, and does not require credit card verification.
+> [!WARNING]
+> **Hugging Face has changed its free tier policies.**
+> Deploying custom Docker containers on Hugging Face Spaces now requires a **paid PRO subscription** or paid compute resources. The free tier only supports Gradio, Streamlit, and static HTML templates. If you wish to use Hugging Face, you must upgrade your account.
 
 * **Drawbacks & Security Warnings**:
-  - **Generous Bandwidth**: Unlike Render's strict 5GB limit, Hugging Face does not enforce a rigid monthly bandwidth quota on free Spaces. This makes it the highly preferred platform for streaming video backups without hitting quota limits.
-  - **Public Repos Only**: Free Spaces must be configured as **Public** to run. Private spaces require a paid subscription. Because your Space is public, **never upload your `.env` file to the files section**. Instead, add your configuration keys in your Space **Settings > Variables and Secrets** as secrets.
+  - **Paid / PRO account required**: You must have a paid account to deploy the Dockerfile configuration of this addon.
+  - **Generous Bandwidth**: Hugging Face does not enforce a rigid monthly bandwidth quota on running Spaces.
+  - **Public Repos Option**: If your Space is public, **never upload your `.env` file to the files section**. Instead, add your configuration keys in your Space **Settings > Variables and Secrets** as secrets.
   - **⚠️ Illegal Activity Termination Policy**: Hugging Face strictly enforces its Acceptable Use Policy. Hosting copyrighted or unauthorized media files for public streaming will lead to **immediate Space deletion, permanent account termination, and potential legal notices/liability** from content owners. Only stream video files you legally own or have permission to access.
-  - **Auto-Sleep**: Auto-sleeps after **48 hours** of inactivity. However, it wakes up within **10-15 seconds** of a new request, which is significantly faster than Render.
+  - **Auto-Sleep**: Free/Hobby containers auto-sleep after **48 hours** of inactivity. However, they wake up within **10-15 seconds** of a new request.
 
 #### Hugging Face Spaces Setup Guide
 
