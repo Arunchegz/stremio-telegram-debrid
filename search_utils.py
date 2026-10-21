@@ -17,7 +17,8 @@ RE_YEAR = re.compile(r'\b(19\d{2}|20\d{2})\b')
 RE_EPISODE_EXPLICIT = re.compile(
     r'\b[sS]\s*(\d{1,2})\s*[eE]\s*(\d{1,4})\b'
     r'|\b[tT]emp(?:orada)?\s*(\d{1,2})\s*[cC]ap(?:itulo)?\s*(\d{1,4})\b'
-    r'|(?<!\d)(\d{1,2})\s*[xX]\s*(\d{1,4})(?!\d)',
+    r'|(?<!\d)(\d{1,2})\s*[xX]\s*(\d{1,4})(?!\d)'
+    r'|(?<![A-Za-z0-9])[sS]\s*(\d{1,2})\s*[-\u2013\u2014]\s*(\d{1,4})(?![A-Za-z0-9])',
     re.IGNORECASE
 )
 RE_EPISODE_ONLY = re.compile(
@@ -53,7 +54,7 @@ def extract_season_episode_pair(text: str) -> Optional[Tuple[int, int]]:
     
     if match:
         g = match.groups()
-        s, e = g[0] or g[2] or g[4], g[1] or g[3] or g[5]
+        s, e = g[0] or g[2] or g[4] or g[6], g[1] or g[3] or g[5] or g[7]
         if s is not None and e is not None:
             try:
                 return int(s), int(e)
@@ -195,7 +196,12 @@ class VideoMatcher:
             f"{clean_name} s{s}e{e}",
             f"{clean_name} {s}x{e}",
             f"{clean_name} s{s} e{e}",
-            f"{clean_name} s{s_padded} e{e_padded}"
+            f"{clean_name} s{s_padded} e{e_padded}",
+            # "[S3-22] Show Name ..." style releases
+            f"{clean_name} s{s}-{e}",
+            f"{clean_name} s{s}-{e_padded}",
+            f"{clean_name} s{s_padded}-{e_padded}",
+            f"s{s}-{e} {clean_name}",
         ]
         
         deduped = []

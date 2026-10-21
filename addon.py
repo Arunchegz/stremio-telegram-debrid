@@ -34,6 +34,7 @@ from utils import (
     parse_season_episode,
     normalize_title,
     _clean_title_prefix,
+    extract_show_title,
 )
 from zip_helper import (
     list_zip_files,
@@ -295,7 +296,7 @@ def build_show_groups(messages: list) -> list:
         season, episode = parse_season_episode(fn)
         if season is None or episode is None:
             continue
-        raw_prefix = _clean_title_prefix(fn) or fn
+        raw_prefix = extract_show_title(fn) or fn
         title = raw_prefix.replace(".", " ").replace("_", " ")
         title = re.sub(r"\s+", " ", title).strip(" -–—.,([{)]}")
         norm = normalize_title(title)

@@ -43,6 +43,13 @@ _EPISODE_SEASON_PATTERNS = [
     re.compile(r'\bc\s*(?P<e>\d{1,3})\s*[.\-_ ]?\s*t\s*(?P<s>\d{1,2})\b', re.IGNORECASE),
 ]
 
+# "S3-22", "[S3-22]", "S03 - 22", "S3–22" (hyphen / en dash / em dash between season and episode).
+# Matched against the RAW filename because _normalize_filename() strips hyphens.
+_SEASON_DASH_EPISODE_PATTERN = re.compile(
+    r'(?<![a-z0-9])s(?P<s>\d{1,2})\s*[-\u2013\u2014]\s*(?P<e>\d{1,4})(?![a-z0-9])',
+    re.IGNORECASE,
+)
+
 _STANDALONE_EPISODE_PATTERNS = [
     re.compile(r'\bep(?:isode)?\s*[.\-_ ]?\s*(?P<e>\d{1,3})\b', re.IGNORECASE),
     re.compile(r'\bcap(?:itulo|ítulo)?\s*[.\-_ ]?\s*(?P<e>\d{1,3})\b', re.IGNORECASE),
@@ -63,6 +70,13 @@ def parse_season_episode(filename: str) -> tuple:
             except (ValueError, KeyError, IndexError):
                 pass
                 
+    m = _SEASON_DASH_EPISODE_PATTERN.search(filename)
+    if m:
+        try:
+            return int(m.group('s')), int(m.group('e'))
+        except (ValueError, KeyError, IndexError):
+            pass
+
     for pat in _STANDALONE_EPISODE_PATTERNS:
         m = pat.search(fn)
         if m:
@@ -203,11 +217,49 @@ def _clean_title_prefix(filename: str) -> str:
         if m:
             first_match_idx = min(first_match_idx, m.start())
             
+    m = _SEASON_DASH_EPISODE_PATTERN.search(filename)
+    if m:
+        first_match_idx = min(first_match_idx, m.start())
+
     year_match = re.search(r'\b(19\d{2}|20[0-2]\d)\b', filename)
     if year_match:
         first_match_idx = min(first_match_idx, year_match.start())
         
     return filename[:first_match_idx].strip()
+
+_QUALITY_CUT = re.compile(
+    r'[\[(]|\b(?:2160p|1080p|720p|480p|360p|4k|web[- ]?dl|web[- ]?rip|blu[- ]?ray|brrip|hdrip|hevc|x26[45]|h\.?26[45]|dual|multi)\b',
+    re.IGNORECASE,
+)
+
+def extract_show_title(filename: str) -> str:
+    """
+    Best-effort show title from an episode filename.
+    Handles tags placed BEFORE the title, e.g. "[S3-22] Attack On Titan [1080p] [Dual] X.mkv"
+    as well as the usual "Show.Name.S01E02.1080p.mkv".
+    """
+    if not filename:
+        return ""
+    name = re.sub(r'\.(mkv|mp4|avi|mov|wmv|flv|webm|ts|m4v)$', '', filename, flags=re.IGNORECASE)
+    prefix = _clean_title_prefix(name)
+    cleaned_prefix = re.sub(r'[\s\-\u2013\u2014.,_\[\](){}]+', '', prefix)
+    if cleaned_prefix:
+        return prefix
+
+    # Season/episode tag is at the very start: the title follows it.
+    best = None
+    for pat in _SEASON_EPISODE_PATTERNS + _EPISODE_SEASON_PATTERNS + [_SEASON_DASH_EPISODE_PATTERN] + _STANDALONE_EPISODE_PATTERNS:
+        m = pat.search(name)
+        if m and (best is None or m.start() < best.start()):
+            best = m
+    if not best:
+        return name
+    rest = name[best.end():]
+    rest = re.sub(r'^[\s\]\)\-\u2013\u2014.:_]+', '', rest)
+    cut = _QUALITY_CUT.search(rest)
+    if cut:
+        rest = rest[:cut.start()]
+    return rest.strip()
 
 def matches_title(filename: str, title: str) -> bool:
     if not title:
