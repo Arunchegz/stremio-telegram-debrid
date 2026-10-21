@@ -4,7 +4,7 @@ emoji: 🎬
 colorFrom: blue
 colorTo: purple
 sdk: docker
-pinned: false
+pinned: false55
 ---
 
 # Telegram Stremio Addon
