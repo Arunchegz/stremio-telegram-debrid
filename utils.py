@@ -50,6 +50,12 @@ _SEASON_DASH_EPISODE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# "10. Cyberpunk Edgerunners [T4TSA.cc].mkv", "01) Show", "05 - Show": episode number at the very
+# start of the filename. Matched against the RAW filename (normalisation removes the "." / "-").
+_LEADING_EPISODE_PATTERN = re.compile(
+    r'^\s*(?P<e>\d{1,3})\s*(?:\.\s+|\)\s+|\s+[-\u2013\u2014]\s+)(?=\S)'
+)
+
 _STANDALONE_EPISODE_PATTERNS = [
     re.compile(r'\bep(?:isode)?\s*[.\-_ ]?\s*(?P<e>\d{1,3})\b', re.IGNORECASE),
     re.compile(r'\bcap(?:itulo|ítulo)?\s*[.\-_ ]?\s*(?P<e>\d{1,3})\b', re.IGNORECASE),
@@ -84,7 +90,14 @@ def parse_season_episode(filename: str) -> tuple:
                 return 1, int(m.group('e'))
             except (ValueError, KeyError, IndexError):
                 pass
-                
+
+    m = _LEADING_EPISODE_PATTERN.search(filename)
+    if m:
+        try:
+            return 1, int(m.group('e'))
+        except (ValueError, KeyError, IndexError):
+            pass
+
     return None, None
 
 def matches_episode(filename: str, season: int, episode: int) -> bool:
@@ -221,6 +234,10 @@ def _clean_title_prefix(filename: str) -> str:
     if m:
         first_match_idx = min(first_match_idx, m.start())
 
+    m = _LEADING_EPISODE_PATTERN.search(filename)
+    if m:
+        first_match_idx = min(first_match_idx, m.start())
+
     year_match = re.search(r'\b(19\d{2}|20[0-2]\d)\b', filename)
     if year_match:
         first_match_idx = min(first_match_idx, year_match.start())
@@ -248,7 +265,7 @@ def extract_show_title(filename: str) -> str:
 
     # Season/episode tag is at the very start: the title follows it.
     best = None
-    for pat in _SEASON_EPISODE_PATTERNS + _EPISODE_SEASON_PATTERNS + [_SEASON_DASH_EPISODE_PATTERN] + _STANDALONE_EPISODE_PATTERNS:
+    for pat in _SEASON_EPISODE_PATTERNS + _EPISODE_SEASON_PATTERNS + [_SEASON_DASH_EPISODE_PATTERN, _LEADING_EPISODE_PATTERN] + _STANDALONE_EPISODE_PATTERNS:
         m = pat.search(name)
         if m and (best is None or m.start() < best.start()):
             best = m

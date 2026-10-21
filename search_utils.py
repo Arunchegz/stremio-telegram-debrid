@@ -23,7 +23,8 @@ RE_EPISODE_EXPLICIT = re.compile(
 )
 RE_EPISODE_ONLY = re.compile(
     r'\b[eE]p(?:isode)?\s*(\d{1,4})\b'
-    r'|\b[cC]ap(?:itulo)?\s*(\d{1,4})\b',
+    r'|\b[cC]ap(?:itulo)?\s*(\d{1,4})\b'
+    r'|^\s*(\d{1,3})\s*(?:\.\s+|\)\s+|\s+[-\u2013\u2014]\s+)(?=\S)',
     re.IGNORECASE
 )
 RE_CLEANUP = re.compile(r'[._\-\[\]()\'",!?:]')
@@ -67,7 +68,7 @@ def extract_standalone_episode(text: str) -> Optional[int]:
         
     if match:
         g = match.groups()
-        e = g[0] or g[1]
+        e = g[0] or g[1] or g[2]
         if e is not None:
             try:
                 return int(e)
