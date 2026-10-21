@@ -1,0 +1,42 @@
+name: Sync to Hugging Face Space
+
+# Mirrors every push on main to your Hugging Face Space so the Space rebuilds automatically.
+#
+# One-time setup (GitHub repo -> Settings -> Secrets and variables -> Actions):
+#   Secret   HF_TOKEN  : Hugging Face access token with WRITE access to the Space
+#   Variable HF_SPACE  : "<hf-username>/<space-name>"  (optional; falls back to the default below)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: sync-to-huggingface
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_SPACE: ${{ vars.HF_SPACE || 'arunchegz1/Telegram_stremio' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check HF_TOKEN is set
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "::error::HF_TOKEN secret is missing. Add it in Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
+      - name: Push to Hugging Face Space
+        run: |
+          HF_USER="${HF_SPACE%%/*}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git push --force "https://${HF_USER}:${HF_TOKEN}@huggingface.co/spaces/${HF_SPACE}" HEAD:main
