@@ -10,6 +10,7 @@ Web configuration wizard (/configure) for the Telegram Stremio addon.
 """
 
 import os
+import re
 import secrets
 import asyncio
 import logging
@@ -121,14 +122,27 @@ async def _current_values() -> dict:
 
 
 def _field(key: str, label: str, values: dict, placeholder: str = "", secret: bool = False,
-          hint: str = "", input_id: str = None, input_type: str = "text") -> str:
+          hint: str = "", input_id: str = None, input_type: str = "text",
+          multiline: bool = False, wide: bool = False) -> str:
     v = values.get(key, "")
     shown = config_store.mask_value(key, v) if secret else v
     hint_html = f'<div class="hint">{hint}</div>' if hint else ""
+    field_id = f"f_{input_id or key}"
+    classes = "field wide" if wide else "field"
+    if multiline:
+        control = (
+            f'<textarea id="{field_id}" data-key="{key}" rows="2" '
+            f'placeholder="{placeholder}" autocomplete="off" spellcheck="false">{shown}</textarea>'
+        )
+    else:
+        control = (
+            f'<input id="{field_id}" data-key="{key}" type="{input_type}" value="{shown}" '
+            f'placeholder="{placeholder}" autocomplete="off" spellcheck="false">'
+        )
     return f"""
-    <div class="field" data-key="{key}">
-        <label for="f_{input_id or key}">{label}</label>
-        <input id="f_{input_id or key}" data-key="{key}" type="{input_type}" value="{shown}" placeholder="{placeholder}" autocomplete="off" spellcheck="false">
+    <div class="{classes}" data-key="{key}">
+        <label for="{field_id}">{label}</label>
+        {control}
         {hint_html}
     </div>"""
 
@@ -206,15 +220,39 @@ def _render_wizard(values: dict, stats: dict, rate_enabled: bool, watch_logs: bo
         </div>
         <div class="grid">
             {_field("USER_SESSION_STRING", "User Session String (recommended)", values, "", secret=True,
-                    hint="Needed for files > 2 GB and public channels. Generate with the session notebook in /deployment/colab")}
+                    hint="Needed for large files, split parts and public channels. Generate with the session notebook in /deployment/colab")}
             {_field("BOT_TOKEN", "Bot Token (fallback)", values, "123456:ABC-DEF...", secret=True,
                     hint="Bot must be admin in the target channels")}
+        </div>
+        <div class="grid">
+            {_field("USER_SESSION_STRINGS", "Additional User Sessions (optional)", values, "", secret=True,
+                    multiline=True, wide=True,
+                    hint="One session string per line (or comma separated). Use different Telegram accounts: extra accounts rotate chunk downloads, which helps with very large split files and per-account FloodWait. The single field above remains the primary session. Replace the whole masked value to change it.")}
         </div>
         <div class="grid">
             {_field("TELEGRAM_CHANNEL_ID", "Media Channel IDs", values, "-1001234567890, -1009876543210",
                     hint="Comma-separated. Right-click a channel in Telegram Desktop → Copy ID (needs developer mode)")}
             {_field("LOG_CHANNEL_ID", "Log Channel ID (optional)", values, "-1001122334455",
                     hint="Play/seek/stop logs with your region time, date, year and play counts are posted here")}
+        </div>
+        <div class="grid">
+            <div class="field" data-key="TG_AUTH_MODE">
+                <label for="f_TG_AUTH_MODE">Credential mode</label>
+                <select id="f_TG_AUTH_MODE" data-key="TG_AUTH_MODE">
+                    <option value="auto" {"selected" if values.get("TG_AUTH_MODE", "auto") == "auto" else ""}>auto — session string, bot token fallback</option>
+                    <option value="user" {"selected" if values.get("TG_AUTH_MODE") == "user" else ""}>user session only</option>
+                    <option value="bot" {"selected" if values.get("TG_AUTH_MODE") == "bot" else ""}>bot token only</option>
+                </select>
+                <div class="hint">auto keeps the bot connected as a fallback if the session string expires</div>
+            </div>
+            {_field("BOT_FILE_LIMIT_MB", "Bot-only file limit (MB)", values, "20", input_type="number",
+                    hint="Bot accounts cannot download large files. 0 disables the check")}
+        </div>
+        <div class="grid">
+            {_field("TG_STREAM_PREFETCH", "Parallel chunk prefetch", values, "4", input_type="number",
+                    hint="1 MiB chunks fetched ahead per stream (2–8 is a good range)")}
+            {_field("TG_STREAM_MAX_RETRIES", "Stream retry attempts", values, "3", input_type="number",
+                    hint="Retries for transient Telegram errors / expired file references")}
         </div>
         <button type="button" class="btn secondary" id="btnTest">Test Telegram connection</button>
         <span id="testResult" class="test-result"></span>
@@ -260,6 +298,16 @@ def _render_wizard(values: dict, stats: dict, rate_enabled: bool, watch_logs: bo
             {_field("RATE_LIMIT_WINDOW", "Rate limit window (seconds)", values, "60", input_type="number")}
             {_field("RATE_LIMIT_STREAM_REQUESTS", "Stream range requests / window / IP", values, "600", input_type="number",
                     hint="Keep this high - players fire many small range requests")}
+        </div>
+        <div class="grid">
+            {_field("RATE_LIMIT_BURST", "API burst allowance", values, "30", input_type="number",
+                    hint="Tokens a client may spend at once (token bucket)")}
+            {_field("RATE_LIMIT_STREAM_BURST", "Stream burst allowance", values, "120", input_type="number",
+                    hint="Lets a player burst after a seek without waiting")}
+        </div>
+        <div class="grid">
+            {_field("RATE_LIMIT_STREAM_CONCURRENCY", "Simultaneous streams / IP", values, "8", input_type="number",
+                    hint="0 disables the concurrency cap")}
         </div>
         <label class="toggle">
             <input type="checkbox" id="f_RATE_LIMIT_ENABLED" data-key="RATE_LIMIT_ENABLED" {"checked" if rate_enabled else ""}>
@@ -448,11 +496,13 @@ h1 {{ font-family:'Plus Jakarta Sans',sans-serif; font-size:1.7rem; letter-spaci
 .grid {{ display:grid; grid-template-columns:1fr; gap:14px; margin:18px 0 6px; }}
 @media(min-width:640px) {{ .grid {{ grid-template-columns:1fr 1fr; }} }}
 .field label, .login-box label {{ display:block; font-size:.78rem; font-weight:600; color:var(--text2); margin-bottom:6px; text-transform:uppercase; letter-spacing:.04em; }}
-.field input, .login-box input, .field select {{
+.field input, .field textarea, .login-box input, .field select {{
   width:100%; background:#09090b; border:1px solid var(--border); color:var(--text);
   padding:11px 14px; border-radius:8px; font-size:.88rem; font-family:'Inter',sans-serif; outline:none; transition:border-color .2s;
 }}
-.field input:focus, .field select:focus, .login-box input:focus {{ border-color:var(--primary); }}
+.field textarea {{ resize:vertical; min-height:58px; line-height:1.45; }}
+.field.wide {{ grid-column:1 / -1; }}
+.field input:focus, .field textarea:focus, .field select:focus, .login-box input:focus {{ border-color:var(--primary); }}
 .hint {{ font-size:.72rem; color:var(--text2); margin-top:5px; line-height:1.45; }}
 .hidden {{ display:none; }}
 .toggle {{ display:flex; align-items:center; gap:10px; margin-top:14px; font-size:.86rem; color:var(--text); cursor:pointer; }}
@@ -662,52 +712,79 @@ async def configure_test(request: Request):
 
     api_id = body.get("API_ID") or Config.API_ID
     api_hash = body.get("API_HASH") or Config.API_HASH
-    session = body.get("USER_SESSION_STRING") or Config.USER_SESSION_STRING
     bot_token = body.get("BOT_TOKEN") or Config.BOT_TOKEN
+
+    # Start with the currently configured sessions, then add any new values
+    # pasted into the wizard (masked placeholders are ignored).
+    session_blobs = list(Config.session_strings())
+    for key in ("USER_SESSION_STRING", "USER_SESSION_STRINGS"):
+        value = body.get(key)
+        if value and "••••" not in str(value):
+            session_blobs.append(str(value))
+    sessions = []
+    seen_sessions = set()
+    for blob in session_blobs:
+        for token in re.split(r"[\s,;]+", blob.strip()):
+            if token and token not in seen_sessions:
+                seen_sessions.add(token)
+                sessions.append(token)
 
     try:
         api_id = int(api_id)
     except (TypeError, ValueError):
         return JSONResponse({"ok": False, "detail": "API_ID must be an integer"})
 
-    if not api_id or not api_hash or (not session and not bot_token):
+    if not api_id or not api_hash or (not sessions and not bot_token):
         return JSONResponse({"ok": False, "detail": "API_ID, API_HASH and (session string or bot token) are required"})
 
     def _masked_token(tok: str) -> str:
         return "".join(ch if ch.isdigit() or ch.isalpha() else ch for ch in tok[:6]) + "..."
 
-    temp = None
-    try:
-        if session:
-            temp = Client(name=f"wizard_test_{secrets.token_hex(4)}", api_id=api_id, api_hash=api_hash,
-                          session_string=session, in_memory=True, no_updates=True)
-        else:
-            temp = Client(name=f"wizard_test_{secrets.token_hex(4)}", api_id=api_id, api_hash=api_hash,
-                          bot_token=bot_token, in_memory=True, no_updates=True)
-        await asyncio.wait_for(temp.start(), timeout=20)
-        me = temp.me
-        user = getattr(me, "username", None) or getattr(me, "first_name", None) or "connected"
-
-        # Also verify the first configured channel is reachable
-        channels = str(body.get("TELEGRAM_CHANNEL_ID") or Config.TELEGRAM_CHANNEL_ID or "")
-        first = channels.split(",")[0].strip() if channels else ""
-        if first:
-            try:
-                chat = await asyncio.wait_for(temp.get_chat(first), timeout=10)
-                user += f" · channel OK ({getattr(chat, 'title', first)})"
-            except Exception as ce:
-                return JSONResponse({"ok": False, "detail": f"Login OK ({user}) but channel not reachable: {ce}"})
-        return JSONResponse({"ok": True, "user": user})
-    except asyncio.TimeoutError:
-        return JSONResponse({"ok": False, "detail": "Timed out connecting to Telegram (check credentials/internet)"})
-    except Exception as e:
-        return JSONResponse({"ok": False, "detail": str(e)})
-    finally:
-        if temp is not None:
+    async def _probe(label: str, **credentials) -> tuple:
+        temp = Client(name=f"wizard_test_{secrets.token_hex(4)}", api_id=api_id, api_hash=api_hash,
+                      in_memory=True, no_updates=True, **credentials)
+        try:
+            await asyncio.wait_for(temp.start(), timeout=20)
+            me = temp.me
+            who = getattr(me, "username", None) or getattr(me, "first_name", None) or "connected"
+            note = f"{label}: {who}"
+            channels = str(body.get("TELEGRAM_CHANNEL_ID") or Config.TELEGRAM_CHANNEL_ID or "")
+            first = channels.split(",")[0].strip() if channels else ""
+            if first:
+                try:
+                    chat = await asyncio.wait_for(temp.get_chat(first), timeout=10)
+                    note += f" · channel OK ({getattr(chat, 'title', first)})"
+                except Exception as ce:
+                    note += f" · channel NOT reachable ({ce})"
+            return True, note
+        except asyncio.TimeoutError:
+            return False, f"{label}: timed out connecting to Telegram"
+        except Exception as e:
+            return False, f"{label}: {e}"
+        finally:
             try:
                 await asyncio.wait_for(temp.stop(), timeout=5)
             except Exception:
                 pass
+
+    probes = []
+    for index, session in enumerate(sessions, 1):
+        label = "user session" if len(sessions) == 1 else f"user session {index}"
+        probes.append(_probe(label, session_string=session))
+    if bot_token:
+        probes.append(_probe("bot token", bot_token=bot_token))
+    probe_results = await asyncio.gather(*probes) if probes else []
+
+    ok_notes, failures = [], []
+    for ok, note in probe_results:
+        (ok_notes if ok else failures).append(note)
+
+    if ok_notes:
+        message = " · ".join(ok_notes)
+        if failures:
+            message += " · fallback failed: " + " · ".join(failures)
+        return JSONResponse({"ok": True, "user": message})
+    return JSONResponse({"ok": False, "detail": " | ".join(failures) or "No credentials to test"})
 
 
 @router.post("/configure/clear-cache")

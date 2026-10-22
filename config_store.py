@@ -8,6 +8,7 @@ Persistent configuration store for the Telegram Stremio addon.
 """
 
 import os
+import re
 import json
 import base64
 import hashlib
@@ -23,18 +24,41 @@ CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 
 # Keys that may be stored/edited via the wizard
 WIZARD_KEYS = [
-    "API_ID", "API_HASH", "BOT_TOKEN", "USER_SESSION_STRING",
+    "API_ID", "API_HASH", "BOT_TOKEN", "USER_SESSION_STRING", "USER_SESSION_STRINGS",
+    "TG_AUTH_MODE",
     "TELEGRAM_CHANNEL_ID", "LOG_CHANNEL_ID",
     "API_KEY", "ADDON_URL", "TIMEZONE",
     "TMDB_API_KEY", "TMDB_LANGUAGE",
     "CACHE_TTL",
     "RATE_LIMIT_ENABLED", "RATE_LIMIT_REQUESTS", "RATE_LIMIT_WINDOW", "RATE_LIMIT_STREAM_REQUESTS",
+    "RATE_LIMIT_BURST", "RATE_LIMIT_STREAM_BURST", "RATE_LIMIT_STREAM_CONCURRENCY",
+    "TRUST_PROXY_HEADERS",
+    "TG_STREAM_PREFETCH", "TG_STREAM_MAX_RETRIES", "BOT_FILE_LIMIT_MB",
     "WATCH_LOG_EVENTS", "CONFIG_PASSWORD",
 ]
 
-_INT_KEYS = {"API_ID", "CACHE_TTL", "RATE_LIMIT_REQUESTS", "RATE_LIMIT_WINDOW", "RATE_LIMIT_STREAM_REQUESTS"}
-_BOOL_KEYS = {"RATE_LIMIT_ENABLED", "WATCH_LOG_EVENTS"}
-_SECRET_KEYS = {"API_HASH", "BOT_TOKEN", "USER_SESSION_STRING", "API_KEY", "TMDB_API_KEY", "CONFIG_PASSWORD"}
+_INT_KEYS = {
+    "API_ID", "CACHE_TTL", "RATE_LIMIT_REQUESTS", "RATE_LIMIT_WINDOW",
+    "RATE_LIMIT_STREAM_REQUESTS", "RATE_LIMIT_BURST", "RATE_LIMIT_STREAM_BURST",
+    "RATE_LIMIT_STREAM_CONCURRENCY", "TG_STREAM_PREFETCH", "TG_STREAM_MAX_RETRIES",
+    "BOT_FILE_LIMIT_MB",
+}
+_BOOL_KEYS = {"RATE_LIMIT_ENABLED", "WATCH_LOG_EVENTS", "TRUST_PROXY_HEADERS"}
+_SECRET_KEYS = {
+    "API_HASH", "BOT_TOKEN", "USER_SESSION_STRING", "USER_SESSION_STRINGS",
+    "API_KEY", "TMDB_API_KEY", "CONFIG_PASSWORD",
+}
+
+
+def _has_session_string(data: dict) -> bool:
+    """Return True when at least one non-masked session string is present."""
+    for key in ("USER_SESSION_STRING", "USER_SESSION_STRINGS"):
+        value = str(data.get(key) or "")
+        if "••••" in value:
+            continue
+        if any(token for token in re.split(r"[\s,;]+", value.strip())):
+            return True
+    return False
 
 
 def _hash_password(password: str, salt: bytes = None) -> str:
@@ -148,7 +172,8 @@ def is_first_run() -> bool:
         return False
     # If the instance already has Telegram credentials or an API key configured,
     # NEVER allow an open first-run claim by random visitors on public deployments!
-    if os.getenv("API_ID") or os.getenv("API_KEY") or os.getenv("BOT_TOKEN") or os.getenv("USER_SESSION_STRING"):
+    if (os.getenv("API_ID") or os.getenv("API_KEY") or os.getenv("BOT_TOKEN")
+            or os.getenv("USER_SESSION_STRING") or os.getenv("USER_SESSION_STRINGS")):
         return False
     return True
 
@@ -184,8 +209,17 @@ def validate_config_dict(data: dict) -> list:
     if not merged.get("API_HASH"):
         errors.append("API_HASH is required (get it from my.telegram.org).")
 
-    if not merged.get("BOT_TOKEN") and not merged.get("USER_SESSION_STRING"):
+    has_sessions = _has_session_string(merged)
+    if not merged.get("BOT_TOKEN") and not has_sessions:
         errors.append("Either BOT_TOKEN or USER_SESSION_STRING is required.")
+
+    auth_mode = str(merged.get("TG_AUTH_MODE") or "auto").strip().lower()
+    if auth_mode not in ("auto", "user", "bot"):
+        errors.append("TG_AUTH_MODE must be auto, user or bot.")
+    elif auth_mode == "user" and not has_sessions:
+        errors.append("TG_AUTH_MODE=user requires USER_SESSION_STRING.")
+    elif auth_mode == "bot" and not merged.get("BOT_TOKEN"):
+        errors.append("TG_AUTH_MODE=bot requires BOT_TOKEN.")
 
     if not merged.get("TELEGRAM_CHANNEL_ID"):
         errors.append("TELEGRAM_CHANNEL_ID is required (comma separated channel ids).")

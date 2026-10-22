@@ -10,6 +10,7 @@ except RuntimeError:
 import zipfile
 import logging
 import anyio
+from collections import OrderedDict
 from typing import List, Union
 from pyrogram.types import Message
 
@@ -18,17 +19,20 @@ logger = logging.getLogger("zip_helper")
 # Keep strong references to background tasks so they are not garbage-collected mid-flight
 _background_tasks = set()
 
+# Number of 1 MiB blocks kept for random access (bounded to avoid growing with playback)
+MAX_CACHED_BLOCKS = 8
+
 VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.ts', '.m4v')
 
 def is_video_file(filename: str) -> bool:
     return filename.lower().endswith(VIDEO_EXTENSIONS)
 
 class TelegramSeekableReader:
-    def __init__(self, client, messages: Union[Message, List[Message]], block_size=1024*1024):
+    def __init__(self, client, messages: Union[Message, List[Message]], block_size=1024*1024, fetcher=None):
         self.client = client
         self.messages = messages if isinstance(messages, list) else [messages]
         self.block_size = block_size
-        
+        self.fetcher = fetcher
         self.parts = []
         self.total_size = 0
         for msg in self.messages:
@@ -43,13 +47,15 @@ class TelegramSeekableReader:
                 "end": self.total_size + media.file_size
             })
             self.total_size += media.file_size
-            
+
         self.pos = 0
-        self.block_cache = {}
+        # Small LRU so a long decompression pass does not keep the whole file in RAM.
+        self.block_cache = OrderedDict()
 
     async def fetch_block(self, part_index: int, block_index: int) -> bytes:
         cache_key = (part_index, block_index)
         if cache_key in self.block_cache:
+            self.block_cache.move_to_end(cache_key)
             return self.block_cache[cache_key]
             
         part = self.parts[part_index]
@@ -57,14 +63,31 @@ class TelegramSeekableReader:
         
         block = b""
         try:
-            # limit=1 will download exactly one block_size (1MB) chunk
-            async for chunk in self.client.stream_media(media, offset=block_index, limit=1):
-                block = chunk
-                break
+            if self.fetcher is not None:
+                # Manager callback: adds retries + expired file-reference refresh.
+                block = await self.fetcher(part["message"], block_index)
+            else:
+                # limit=1 will download exactly one block_size (1MB) chunk
+                generator = self.client.stream_media(media, offset=block_index, limit=1)
+                try:
+                    async for chunk in generator:
+                        block = chunk
+                        break
+                finally:
+                    aclose = getattr(generator, "aclose", None)
+                    if aclose is not None:
+                        try:
+                            await aclose()
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            pass
         except Exception as e:
             logger.error(f"Error fetching block {block_index} for part {part_index}: {e}")
-            
+
         self.block_cache[cache_key] = block
+        while len(self.block_cache) > MAX_CACHED_BLOCKS:
+            self.block_cache.popitem(last=False)
         return block
 
     async def read_range(self, start: int, end: int) -> bytes:
@@ -158,8 +181,8 @@ def list_zip_files_sync(reader: TelegramSeekableReader, loop: asyncio.AbstractEv
         return []
 
 
-async def list_zip_files(client, messages: Union[Message, List[Message]]) -> list:
-    reader = TelegramSeekableReader(client, messages)
+async def list_zip_files(client, messages: Union[Message, List[Message]], fetcher=None) -> list:
+    reader = TelegramSeekableReader(client, messages, fetcher=fetcher)
     if reader.total_size < 4:
         return []
         

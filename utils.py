@@ -1,6 +1,8 @@
 import re
 import logging
 import unicodedata
+import urllib.parse
+
 import httpx
 
 logger = logging.getLogger("utils")
@@ -169,6 +171,67 @@ def parse_split_info(filename: str) -> tuple:
         return base, part
         
     return None, None
+
+def parse_http_range(range_header: str, total_size: int):
+    """Parse a single-range HTTP ``Range`` header.
+
+    Returns ``None`` when the header is absent, a ``(start, end)`` tuple with an
+    inclusive end otherwise. Raises ``ValueError`` for malformed, multi-range or
+    unsatisfiable values (callers should answer those with 416).
+    """
+    if not range_header:
+        return None
+    if total_size <= 0:
+        raise ValueError("empty resource")
+
+    value = range_header.strip()
+    if not value.lower().startswith("bytes="):
+        raise ValueError("unsupported range unit")
+
+    spec = value[len("bytes="):].strip()
+    if not spec or "," in spec:
+        raise ValueError("only a single byte range is supported")
+
+    start_raw, sep, end_raw = spec.partition("-")
+    if not sep:
+        raise ValueError("invalid range")
+
+    start_raw = start_raw.strip()
+    end_raw = end_raw.strip()
+
+    if not start_raw:
+        # Suffix range: bytes=-N (last N bytes)
+        if not end_raw.isdigit():
+            raise ValueError("invalid suffix range")
+        suffix = int(end_raw)
+        if suffix <= 0:
+            raise ValueError("invalid suffix range")
+        start = max(0, total_size - suffix)
+        end = total_size - 1
+    else:
+        if not start_raw.isdigit() or (end_raw and not end_raw.isdigit()):
+            raise ValueError("invalid range bounds")
+        start = int(start_raw)
+        if start >= total_size:
+            raise ValueError("range starts past end of resource")
+        end = int(end_raw) if end_raw else total_size - 1
+        if end < start:
+            raise ValueError("range end before start")
+        end = min(end, total_size - 1)
+
+    return start, end
+
+
+def content_disposition(filename: str, inline: bool = True) -> str:
+    """Build a header-safe Content-Disposition value for arbitrary filenames."""
+    name = (filename or "download").replace("\\", "/").rsplit("/", 1)[-1]
+    # Keep the quoted ASCII fallback free of characters that break the header.
+    safe = "".join(ch for ch in name if ch.isprintable() and ch not in '"\\\r\n')
+    fallback = safe.encode("ascii", "ignore").decode("ascii").strip() or "download"
+    encoded = urllib.parse.quote(name, safe="")
+    kind = "inline" if inline else "attachment"
+    return f"{kind}; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
+
 
 _metadata_cache = {}
 

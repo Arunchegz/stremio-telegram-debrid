@@ -21,7 +21,11 @@ import config_store
 import cache
 import metadata as meta_enricher
 from ratelimit import check_rate_limit
-from tg_client import tg_client_manager
+from tg_client import (
+    tg_client_manager,
+    TelegramUnavailable,
+    BotFileLimitError,
+)
 from utils import (
     format_size,
     matches_episode,
@@ -35,6 +39,8 @@ from utils import (
     normalize_title,
     _clean_title_prefix,
     extract_show_title,
+    parse_http_range,
+    content_disposition,
 )
 from zip_helper import (
     list_zip_files,
@@ -90,8 +96,6 @@ async def lifespan(app: FastAPI):
         cache.init(os.path.join(config_store.DATA_DIR, "addon_cache.db"))
         try:
             Config.validate()
-            await tg_client_manager.start()
-            start_watch_finalizer()
         except ValueError as e:
             # Not configured yet: keep the web server alive so the owner can
             # finish setup through the /configure wizard from the browser.
@@ -99,6 +103,16 @@ async def lifespan(app: FastAPI):
             logger.warning(f"CONFIG INCOMPLETE: {e}")
             logger.warning("Open /configure in your browser to set up the addon without env vars.")
             logger.warning("=" * 60)
+        else:
+            try:
+                await tg_client_manager.start()
+            except Exception as e:
+                # A bad/expired session must not take the wizard offline.
+                logger.warning("=" * 60)
+                logger.warning(f"TELEGRAM CONNECTION FAILED: {e}")
+                logger.warning("Open /configure, check the credentials, and save again.")
+                logger.warning("=" * 60)
+            start_watch_finalizer()
         yield
     finally:
         global _finalizer_task
@@ -161,24 +175,51 @@ app.add_middleware(
 @app.middleware("http")
 async def addon_middleware(request: Request, call_next):
     # Optional per-IP rate limiting (owner toggle - enable when sharing publicly)
+    release_slot = None
+    limit_headers = {}
     if Config.RATE_LIMIT_ENABLED:
         path = request.url.path
         bucket = None
-        if ("/stream/file/" in path or "/stream/split/" in path
-                or "/stream/zip/" in path or "/stream/subtitle/" in path):
+        if path.startswith("/stream/") and not path.endswith(".json"):
             bucket = "stream"
-        elif path.endswith(".json") and ("/catalog/" in path or "/meta/" in path or "/subtitles/" in path):
+        elif path.endswith(".json") and not path.endswith("/manifest.json"):
             bucket = "api"
         if bucket:
-            allowed, retry_after, headers = await check_rate_limit(request, bucket)
+            track = bucket == "stream" and request.method == "GET"
+            allowed, retry_after, limit_headers, release_slot = await check_rate_limit(
+                request, bucket, track_concurrency=track
+            )
             if not allowed:
                 return JSONResponse(
                     {"detail": "Rate limit exceeded. Please slow down."},
                     status_code=429,
-                    headers=headers,
+                    headers=limit_headers,
                 )
 
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    except Exception:
+        if release_slot is not None:
+            release_slot()
+        raise
+
+    for header, value in limit_headers.items():
+        response.headers.setdefault(header, value)
+
+    if release_slot is not None:
+        from starlette.background import BackgroundTask
+
+        previous = response.background
+
+        async def _release():
+            try:
+                release_slot()
+            finally:
+                if previous is not None:
+                    await previous()
+
+        response.background = BackgroundTask(_release)
+
     if "/stream/" in request.url.path:
         response.headers["X-Accel-Buffering"] = "no"
     return response
@@ -1131,7 +1172,7 @@ async def catalog_handler(
             is_zip = False
             if base_name.lower().endswith(".zip"):
                 try:
-                    entries = await list_zip_files(tg_client_manager.client, parts)
+                    entries = await list_zip_files(tg_client_manager.client, parts, fetcher=tg_client_manager.fetch_block)
                     video_entries = [e for e in entries if is_video_file(e.filename)]
                     if video_entries:
                         is_zip = True
@@ -1172,7 +1213,7 @@ async def catalog_handler(
             is_zip = False
             if file_name.lower().endswith(".zip"):
                 try:
-                    entries = await list_zip_files(tg_client_manager.client, msg)
+                    entries = await list_zip_files(tg_client_manager.client, msg, fetcher=tg_client_manager.fetch_block)
                     video_entries = [e for e in entries if is_video_file(e.filename)]
                     if video_entries:
                         is_zip = True
@@ -1383,7 +1424,7 @@ async def meta_handler(type: str, meta_id: str, api_key: str = ""):
 
         if is_zip_entry and zip_entry_filename:
             file_name = zip_entry_filename
-            zip_entries = await list_zip_files(tg_client_manager.client, messages)
+            zip_entries = await list_zip_files(tg_client_manager.client, messages, fetcher=tg_client_manager.fetch_block)
             file_size = 0
             for entry in zip_entries:
                 if entry.filename == zip_entry_filename:
@@ -1513,16 +1554,36 @@ def _stream_qs(actual_key: str, type_str: str = "") -> str:
     return ("?" + "&".join(params)) if params else ""
 
 
-def _range_start(request: Request, total_size: int) -> int:
-    range_header = request.headers.get("Range")
-    if range_header:
-        try:
-            bytes_range = range_header.replace("bytes=", "").split("-")
-            if bytes_range[0]:
-                return int(bytes_range[0])
-        except ValueError:
-            pass
-    return 0
+def _resolve_range(request: Request, total_size: int) -> tuple:
+    """Return ``(start, end, partial)`` or raise HTTPException(416)."""
+    header = request.headers.get("Range")
+    try:
+        parsed = parse_http_range(header, total_size)
+    except ValueError:
+        raise HTTPException(
+            status_code=416,
+            detail="Requested range not satisfiable",
+            headers={"Content-Range": f"bytes */{total_size}", "Accept-Ranges": "bytes"},
+        )
+    if parsed is None:
+        return 0, total_size - 1, False
+    start, end = parsed
+    return start, end, True
+
+
+def _stream_headers(filename: str, start: int, end: int, total_size: int,
+                    partial: bool, mime_type: str) -> dict:
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(end - start + 1),
+        "Content-Disposition": content_disposition(filename),
+        "Connection": "keep-alive",
+        "Cache-Control": "no-cache",
+        "Content-Type": mime_type,
+    }
+    if partial:
+        headers["Content-Range"] = f"bytes {start}-{end}/{total_size}"
+    return headers
 
 
 def _cached_poster_for(filename: str):
@@ -1628,7 +1689,7 @@ async def stream_handler(
                         messages.append(msg)
 
                 if messages:
-                    zip_entries = await list_zip_files(tg_client_manager.client, messages)
+                    zip_entries = await list_zip_files(tg_client_manager.client, messages, fetcher=tg_client_manager.fetch_block)
                     file_size = 0
                     for entry in zip_entries:
                         if entry.filename == zip_entry_filename:
@@ -1787,7 +1848,7 @@ async def stream_handler(
                         is_zip = False
                         if base_name.lower().endswith(".zip"):
                             try:
-                                entries = await list_zip_files(tg_client_manager.client, parts)
+                                entries = await list_zip_files(tg_client_manager.client, parts, fetcher=tg_client_manager.fetch_block)
                                 video_entries = [e for e in entries if is_video_file(e.filename)]
                                 if video_entries:
                                     is_zip = True
@@ -1857,7 +1918,7 @@ async def stream_handler(
                         is_zip = False
                         if file_name.lower().endswith(".zip"):
                             try:
-                                entries = await list_zip_files(tg_client_manager.client, msg)
+                                entries = await list_zip_files(tg_client_manager.client, msg, fetcher=tg_client_manager.fetch_block)
                                 video_entries = [e for e in entries if is_video_file(e.filename)]
                                 if video_entries:
                                     is_zip = True
@@ -2005,7 +2066,9 @@ async def tg_subtitle_proxy(
 
     try:
         chat_id_val = _to_int_chat(chat_id)
-        msg = await tg_client_manager.get_message(message_id, chat_id=chat_id_val)
+        msg = await tg_client_manager.get_message(message_id, chat_id=chat_id_val, live=True)
+    except TelegramUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         logger.error(f"Proxy failed to fetch subtitle message: {e}")
         raise HTTPException(status_code=404, detail="Subtitle file not found")
@@ -2027,7 +2090,7 @@ async def tg_subtitle_proxy(
         content_type = "text/plain"
 
     headers = {
-        "Content-Disposition": f'inline; filename="{filename}"',
+        "Content-Disposition": content_disposition(filename),
         "Access-Control-Allow-Origin": "*",
         "Content-Length": str(media.file_size),
     }
@@ -2040,9 +2103,14 @@ async def tg_subtitle_proxy(
         )
 
     try:
+        tg_client_manager.ensure_streamable(int(media.file_size or 0))
         logger.info(f"Downloading subtitle file from Telegram: {filename} (msg ID {message_id})")
-        file_buffer = await tg_client_manager.client.download_media(msg, in_memory=True)
+        file_buffer = await tg_client_manager.client_for_stream(int(media.file_size or 0)).download_media(msg, in_memory=True)
         content = file_buffer.getvalue()
+    except BotFileLimitError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except TelegramUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         logger.error(f"Failed to download subtitle file: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve subtitle media")
@@ -2067,11 +2135,13 @@ async def tg_stream_proxy(
 
     try:
         chat_id_val = _to_int_chat(chat_id)
-        # Get fresh message reference for streaming
-        try:
-            msg = await tg_client_manager.client.get_messages(chat_id=chat_id_val, message_ids=message_id)
-        except Exception:
-            msg = await tg_client_manager.get_message(message_id, chat_id=chat_id_val)
+        # Live message = real Pyrogram object with a usable file reference.
+        # It is reused for TG_STREAM_MESSAGE_TTL and auto-refreshed on expiry.
+        msg = await tg_client_manager.get_message(
+            message_id, chat_id=chat_id_val, live=True
+        )
+    except TelegramUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         logger.error(f"Proxy failed to fetch message: {e}")
         raise HTTPException(status_code=404, detail="Media file not found")
@@ -2083,102 +2153,39 @@ async def tg_stream_proxy(
     if not media:
         raise HTTPException(status_code=404, detail="No playable media found in message")
 
-    file_size = media.file_size
+    file_size = int(media.file_size or 0)
+    if file_size <= 0:
+        raise HTTPException(status_code=404, detail="Telegram reported an empty file")
     mime_type = media.mime_type or "video/mp4"
 
-    start = _range_start(request, file_size)
+    try:
+        tg_client_manager.ensure_streamable(file_size)
+    except BotFileLimitError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except TelegramUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+    start, end, partial = _resolve_range(request, file_size)
+
     _record_play(request, f"file:{chat_id_val}:{message_id}", f"tgfile_{chat_id_val}_{message_id}",
                  filename, file_size, start, chat_id_val, message_id)
 
-    end = file_size - 1
-    if request.headers.get("Range"):
-        try:
-            bytes_range = request.headers.get("Range").replace("bytes=", "").split("-")
-            if len(bytes_range) > 1 and bytes_range[1]:
-                end = int(bytes_range[1])
-        except ValueError:
-            pass
-
-    content_length = end - start + 1
-
-    chunk_size = 1024 * 1024
-    offset = start // chunk_size
-    skip_bytes = start % chunk_size
-
-    headers = {
-        "Accept-Ranges": "bytes",
-        "Content-Length": str(content_length),
-        "Content-Disposition": f'inline; filename="{filename}"',
-        "Connection": "keep-alive",
-        "Cache-Control": "no-cache",
-        "X-Accel-Buffering": "no",
-    }
-
-    # Content-Range must only be sent on 206
-    status_code = 200
-    if request.headers.get("Range"):
-        status_code = 206
-        headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+    status_code = 206 if partial else 200
+    headers = _stream_headers(filename, start, end, file_size, partial, mime_type)
 
     if request.method == "HEAD":
         logger.info(f"HEAD request for media '{filename}' (bytes {start}-{end}/{file_size}) - Status {status_code}")
-        return Response(
-            status_code=status_code,
-            media_type=mime_type,
-            headers=headers
-        )
+        return Response(status_code=status_code, headers=headers)
 
     async def file_generator():
-        nonlocal msg
-        bytes_sent = 0
-        bytes_to_skip = skip_bytes
-        retry_count = 0
-        max_retries = 2
-        current_offset = offset
-
-        while retry_count <= max_retries:
-            try:
-                # Stream using message object
-                async for chunk in tg_client_manager.client.stream_media(msg, offset=current_offset):
-                    if bytes_to_skip > 0:
-                        if bytes_to_skip < len(chunk):
-                            chunk = chunk[bytes_to_skip:]
-                            bytes_to_skip = 0
-                        else:
-                            bytes_to_skip -= len(chunk)
-                            continue
-
-                    if bytes_sent + len(chunk) > content_length:
-                        chunk = chunk[:content_length - bytes_sent]
-
-                    yield chunk
-                    bytes_sent += len(chunk)
-
-                    if bytes_sent >= content_length:
-                        break
-                # Stream completed successfully
-                break
-            except asyncio.CancelledError:
-                logger.info(f"Streaming cancelled by client for message {message_id}")
-                break
-            except Exception as e:
-                err_str = str(e).upper()
-                is_expired = "FILEREFERENCEEXPIRED" in type(e).__name__.upper() or "FILE_REFERENCE" in err_str
-                if is_expired and retry_count < max_retries:
-                    retry_count += 1
-                    logger.warning(f"File reference expired for message {message_id}, refreshing and retrying ({retry_count}/{max_retries})")
-                    try:
-                        msg = await tg_client_manager.client.get_messages(chat_id=chat_id_val, message_ids=message_id)
-                        total_bytes_streamed = start + bytes_sent
-                        current_offset = total_bytes_streamed // chunk_size
-                        bytes_to_skip = total_bytes_streamed % chunk_size
-                        continue
-                    except Exception as refresh_err:
-                        logger.error(f"Failed to refresh message for reference recovery: {refresh_err}")
-                        break
-                else:
-                    logger.error(f"Streaming error on message {message_id}: {e}")
-                    break
+        try:
+            async for chunk in tg_client_manager.iter_media_range(msg, start, end):
+                yield chunk
+        except asyncio.CancelledError:
+            logger.info(f"Streaming cancelled by client for message {message_id}")
+            raise
+        except Exception as e:
+            logger.error(f"Streaming error on message {message_id}: {e}")
 
     logger.info(f"Streaming media '{filename}' (bytes {start}-{end}/{file_size}) - Status {status_code}")
 
@@ -2213,122 +2220,67 @@ async def tg_split_stream_proxy(
     chunks_info = []
     total_size = 0
 
-    for msg_id in msg_id_list:
+    try:
+        messages = await tg_client_manager.get_messages(msg_id_list, chat_id=chat_id_val)
+    except TelegramUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    for msg_id, msg in zip(msg_id_list, messages):
+        if not msg:
+            raise HTTPException(status_code=404, detail=f"Message {msg_id} not found")
+        media = msg.video or msg.document or msg.audio
+        if not media:
+            raise HTTPException(status_code=400, detail=f"No media in message {msg_id}")
+        part_size = int(media.file_size or 0)
+        if part_size <= 0:
+            raise HTTPException(status_code=404, detail=f"Empty media in message {msg_id}")
         try:
-            # Get fresh message reference for streaming
-            try:
-                msg = await tg_client_manager.client.get_messages(chat_id=chat_id_val, message_ids=msg_id)
-            except Exception:
-                msg = await tg_client_manager.get_message(msg_id, chat_id=chat_id_val)
+            tg_client_manager.ensure_streamable(part_size)
+        except BotFileLimitError as e:
+            raise HTTPException(status_code=502, detail=str(e))
+        except TelegramUnavailable as e:
+            raise HTTPException(status_code=503, detail=str(e))
 
-            if not msg:
-                raise HTTPException(status_code=404, detail=f"Message {msg_id} not found")
-            media = msg.video or msg.document or msg.audio
-            if not media:
-                raise HTTPException(status_code=400, detail=f"No media in message {msg_id}")
+        chunks_info.append({
+            "msg": msg,
+            "media": media,
+            "size": part_size,
+            "start_byte": total_size,
+            "end_byte": total_size + part_size - 1,
+        })
+        total_size += part_size
 
-            chunks_info.append({
-                "msg": msg,
-                "media": media,
-                "size": media.file_size,
-                "start_byte": total_size,
-                "end_byte": total_size + media.file_size - 1
-            })
-            total_size += media.file_size
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"Error fetching metadata for msg {msg_id}: {e}")
-            raise HTTPException(status_code=500, detail="Failed resolving split file metadata")
-
-    start = _range_start(request, total_size)
+    start, end, partial = _resolve_range(request, total_size)
     _record_play(request, f"split:{chat_id_val}:{message_ids}", f"tgfile_split_{chat_id_val}_{message_ids}",
                  filename, total_size, start, chat_id_val, msg_id_list[0])
 
-    end = total_size - 1
-    if request.headers.get("Range"):
-        try:
-            bytes_range = request.headers.get("Range").replace("bytes=", "").split("-")
-            if len(bytes_range) > 1 and bytes_range[1]:
-                end = int(bytes_range[1])
-        except ValueError:
-            pass
-
-    content_length = end - start + 1
     mime_type = chunks_info[0]["media"].mime_type or "video/mp4"
-
-    headers = {
-        "Accept-Ranges": "bytes",
-        "Content-Length": str(content_length),
-        "Content-Disposition": f'inline; filename="{filename}"',
-        "Connection": "keep-alive",
-        "Cache-Control": "no-cache",
-        "X-Accel-Buffering": "no",
-    }
-
-    status_code = 200
-    if request.headers.get("Range"):
-        status_code = 206
-        headers["Content-Range"] = f"bytes {start}-{end}/{total_size}"
+    status_code = 206 if partial else 200
+    headers = _stream_headers(filename, start, end, total_size, partial, mime_type)
 
     if request.method == "HEAD":
-        return Response(
-            status_code=status_code,
-            media_type=mime_type,
-            headers=headers
-        )
+        return Response(status_code=status_code, headers=headers)
 
     async def split_file_generator():
-        bytes_sent = 0
-        block_size = 1024 * 1024  # 1 MB blocks
+        try:
+            for chunk in chunks_info:
+                c_start = chunk["start_byte"]
+                c_end = chunk["end_byte"]
 
-        for chunk in chunks_info:
-            c_start = chunk["start_byte"]
-            c_end = chunk["end_byte"]
+                if c_end < start or c_start > end:
+                    continue
 
-            if c_end < start or c_start > end:
-                continue
+                read_start = max(c_start, start) - c_start
+                read_end = min(c_end, end) - c_start
 
-            read_start = max(c_start, start)
-            read_end = min(c_end, end)
-            chunk_read_len = read_end - read_start + 1
-
-            local_offset = read_start - c_start
-            offset_blocks = local_offset // block_size
-            skip_bytes = local_offset % block_size
-
-            chunk_bytes_sent = 0
-            bytes_to_skip = skip_bytes
-
-            try:
-                # Stream using message object
-                async for block in tg_client_manager.client.stream_media(chunk["msg"], offset=offset_blocks):
-                    if bytes_to_skip > 0:
-                        if bytes_to_skip < len(block):
-                            block = block[bytes_to_skip:]
-                            bytes_to_skip = 0
-                        else:
-                            bytes_to_skip -= len(block)
-                            continue
-
-                    if chunk_bytes_sent + len(block) > chunk_read_len:
-                        block = block[:chunk_read_len - chunk_bytes_sent]
-
+                async for block in tg_client_manager.iter_media_range(
+                    chunk["msg"], read_start, read_end
+                ):
                     yield block
-                    chunk_bytes_sent += len(block)
-                    bytes_sent += len(block)
-
-                    if chunk_bytes_sent >= chunk_read_len:
-                        break
-            except asyncio.CancelledError:
-                logger.info("Split streaming cancelled by client")
-                break
-            except Exception as e:
-                logger.error(f"Error streaming split chunk: {e}")
-                break
-
-            if bytes_sent >= content_length:
-                break
+        except asyncio.CancelledError:
+            logger.info("Split streaming cancelled by client")
+            raise
+        except Exception as e:
+            logger.error(f"Error streaming split file '{filename}': {e}")
 
     logger.info(f"Streaming split media '{filename}' (bytes {start}-{end}/{total_size}) - Status {status_code}")
 
@@ -2360,20 +2312,26 @@ async def tg_zip_stream_proxy(
     except Exception:
         chat_id_val = chat_id
 
-    messages = []
-    for msg_id in msg_id_list:
-        # Get fresh message reference for streaming
-        try:
-            msg = await tg_client_manager.client.get_messages(chat_id=chat_id_val, message_ids=msg_id)
-        except Exception:
-            msg = await tg_client_manager.get_message(msg_id, chat_id=chat_id_val)
-        if msg:
-            messages.append(msg)
-
+    try:
+        messages = await tg_client_manager.get_messages(msg_id_list, chat_id=chat_id_val)
+    except TelegramUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    messages = [m for m in messages if m]
     if not messages:
         raise HTTPException(status_code=404, detail="Messages not found")
 
-    zip_entries = await list_zip_files(tg_client_manager.client, messages)
+    for msg in messages:
+        media = msg.video or msg.document or msg.audio
+        if not media:
+            raise HTTPException(status_code=400, detail="No media in ZIP archive messages")
+        try:
+            tg_client_manager.ensure_streamable(int(media.file_size or 0))
+        except BotFileLimitError as e:
+            raise HTTPException(status_code=502, detail=str(e))
+        except TelegramUnavailable as e:
+            raise HTTPException(status_code=503, detail=str(e))
+
+    zip_entries = await list_zip_files(tg_client_manager.client, messages, fetcher=tg_client_manager.fetch_block)
     target_entry = None
     for entry in zip_entries:
         if entry.filename == filename:
@@ -2384,6 +2342,8 @@ async def tg_zip_stream_proxy(
         raise HTTPException(status_code=404, detail=f"File '{filename}' not found in ZIP archive")
 
     file_size = target_entry.file_size
+    if file_size <= 0:
+        raise HTTPException(status_code=404, detail="ZIP entry is empty")
     mime_type = "video/mp4"
     filename_lower = filename.lower()
     if filename_lower.endswith(".mkv"):
@@ -2393,52 +2353,25 @@ async def tg_zip_stream_proxy(
     elif filename_lower.endswith(".avi"):
         mime_type = "video/x-msvideo"
 
-    start = _range_start(request, file_size)
+    start, end, partial = _resolve_range(request, file_size)
     zip_prefix = "tgfile_splitzip_" if len(msg_id_list) > 1 else "tgfile_zip_"
     _record_play(request, f"zip:{chat_id_val}:{message_ids}:{filename}", f"{zip_prefix}{chat_id_val}_{message_ids}//{filename}",
                  filename, file_size, start, chat_id_val, msg_id_list[0])
 
-    end = file_size - 1
-    if request.headers.get("Range"):
-        try:
-            bytes_range = request.headers.get("Range").replace("bytes=", "").split("-")
-            if len(bytes_range) > 1 and bytes_range[1]:
-                end = int(bytes_range[1])
-        except ValueError:
-            pass
-
-    content_length = end - start + 1
-
-    headers = {
-        "Accept-Ranges": "bytes",
-        "Content-Length": str(content_length),
-        "Content-Disposition": f'inline; filename="{filename}"',
-        "Connection": "keep-alive",
-        "Cache-Control": "no-cache",
-        "X-Accel-Buffering": "no",
-    }
-
-    status_code = 200
-    if request.headers.get("Range"):
-        status_code = 206
-        headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+    status_code = 206 if partial else 200
+    headers = _stream_headers(filename, start, end, file_size, partial, mime_type)
 
     if request.method == "HEAD":
-        return Response(
-            status_code=status_code,
-            media_type=mime_type,
-            headers=headers
-        )
+        return Response(status_code=status_code, headers=headers)
 
     import zipfile
     if target_entry.compress_type == zipfile.ZIP_STORED:
         logger.info(f"ZIP entry '{filename}' is STORED (uncompressed). Using direct offset proxy.")
-        reader = TelegramSeekableReader(tg_client_manager.client, messages)
+        reader = TelegramSeekableReader(tg_client_manager.client, messages, fetcher=tg_client_manager.fetch_block)
         data_start = await get_zip_entry_data_offset(reader, target_entry.header_offset)
 
         stream_start = data_start + start
         stream_end = data_start + end
-        stream_len = stream_end - stream_start + 1
 
         chunks_info = []
         total_size = 0
@@ -2449,61 +2382,31 @@ async def tg_zip_stream_proxy(
                 "media": part["media"],
                 "size": part["size"],
                 "start_byte": part["start"],
-                "end_byte": part["end"] - 1
+                "end_byte": part["end"] - 1,
             })
             total_size += part["size"]
 
         async def split_file_generator():
-            bytes_sent = 0
-            block_size = 1024 * 1024
+            try:
+                for chunk in chunks_info:
+                    c_start = chunk["start_byte"]
+                    c_end = chunk["end_byte"]
 
-            for chunk in chunks_info:
-                c_start = chunk["start_byte"]
-                c_end = chunk["end_byte"]
+                    if c_end < stream_start or c_start > stream_end:
+                        continue
 
-                if c_end < stream_start or c_start > stream_end:
-                    continue
+                    read_start = max(c_start, stream_start) - c_start
+                    read_end = min(c_end, stream_end) - c_start
 
-                read_start = max(c_start, stream_start)
-                read_end = min(c_end, stream_end)
-                chunk_read_len = read_end - read_start + 1
-
-                local_offset = read_start - c_start
-                offset_blocks = local_offset // block_size
-                skip_bytes = local_offset % block_size
-
-                chunk_bytes_sent = 0
-                bytes_to_skip = skip_bytes
-
-                try:
-                    # Stream using message object
-                    async for block in tg_client_manager.client.stream_media(chunk["message"], offset=offset_blocks):
-                        if bytes_to_skip > 0:
-                            if bytes_to_skip < len(block):
-                                block = block[bytes_to_skip:]
-                                bytes_to_skip = 0
-                            else:
-                                bytes_to_skip -= len(block)
-                                continue
-
-                        if chunk_bytes_sent + len(block) > chunk_read_len:
-                            block = block[:chunk_read_len - chunk_bytes_sent]
-
+                    async for block in tg_client_manager.iter_media_range(
+                        chunk["message"], read_start, read_end
+                    ):
                         yield block
-                        chunk_bytes_sent += len(block)
-                        bytes_sent += len(block)
-
-                        if chunk_bytes_sent >= chunk_read_len:
-                            break
-                except asyncio.CancelledError:
-                    logger.info("ZIP streaming cancelled by client")
-                    break
-                except Exception as e:
-                    logger.error(f"Error streaming split ZIP chunk: {e}")
-                    break
-
-                if bytes_sent >= stream_len:
-                    break
+            except asyncio.CancelledError:
+                logger.info("ZIP streaming cancelled by client")
+                raise
+            except Exception as e:
+                logger.error(f"Error streaming split ZIP entry '{filename}': {e}")
 
         logger.info(f"Streaming uncompressed ZIP entry '{filename}' (raw bytes {stream_start}-{stream_end}/{total_size}) - Status {status_code}")
         return StreamingResponse(
@@ -2514,7 +2417,7 @@ async def tg_zip_stream_proxy(
         )
     else:
         logger.info(f"ZIP entry '{filename}' is COMPRESSED (type {target_entry.compress_type}). Streaming on-the-fly decompression.")
-        reader = TelegramSeekableReader(tg_client_manager.client, messages)
+        reader = TelegramSeekableReader(tg_client_manager.client, messages, fetcher=tg_client_manager.fetch_block)
         return StreamingResponse(
             zip_compressed_generator(reader, filename, start, end),
             status_code=status_code,

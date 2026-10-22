@@ -23,11 +23,27 @@
       "required": true
     },
     "USER_SESSION_STRING": {
-      "description": "Pyrogram string session (highly recommended for >2GB files)",
+      "description": "Primary Pyrogram string session (highly recommended for large files)",
+      "required": false
+    },
+    "USER_SESSION_STRINGS": {
+      "description": "Optional extra Pyrogram session strings for stream rotation (one per line or comma-separated)",
       "required": false
     },
     "BOT_TOKEN": {
       "description": "Bot token from @BotFather (fallback if USER_SESSION_STRING is not used)",
+      "required": false
+    },
+    "TG_AUTH_MODE": {
+      "description": "Credential mode: auto (session string with bot-token fallback), user, or bot (default: auto)",
+      "required": false
+    },
+    "TG_STREAM_PREFETCH": {
+      "description": "Parallel 1 MiB chunks fetched ahead per stream (default: 4)",
+      "required": false
+    },
+    "BOT_FILE_LIMIT_MB": {
+      "description": "Bot-only download guard in MB (default: 20, 0 disables)",
       "required": false
     },
     "API_KEY": {

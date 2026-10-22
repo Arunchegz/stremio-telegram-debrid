@@ -25,7 +25,16 @@ services:
         placeholder: "Create a secure key to lock your addon (optional)"
       - key: USER_SESSION_STRING
         sync: false
-        placeholder: "Optional Pyrogram Session String (recommended for files > 2GB)"
+        placeholder: "Primary Pyrogram Session String (recommended for large files)"
+      - key: USER_SESSION_STRINGS
+        sync: false
+        placeholder: "Optional extra session strings for stream rotation (one per line or comma-separated)"
+      - key: TG_AUTH_MODE
+        sync: false
+        placeholder: "Credential mode: auto (session + bot fallback), user, or bot (default: auto)"
+      - key: TG_STREAM_PREFETCH
+        sync: false
+        placeholder: "Parallel 1 MiB chunk prefetch per stream (default: 4)"
       - key: ADDON_URL
         sync: false
         placeholder: "https://your-addon-name.onrender.com"

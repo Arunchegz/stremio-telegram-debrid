@@ -125,7 +125,7 @@ Grouped by the stuff you'd actually care about, not the order I wrote the code i
 
 **A cache that keeps Telegram happy.** This matters more than people think: hammering Telegram's API is how accounts end up restricted. The addon serves repeat lookups from its cache first, runs at most 2 searches at a time with a small delay between them, and backs off automatically when Telegram says "slow down" (FloodWait). The cache lives in a SQLite file, so it survives restarts instead of starting cold every time.
 
-**Rate limiting you control.** Off by default — your personal instance, your call. If you ever share the addon link with a group, turn it on (one checkbox in the wizard or `RATE_LIMIT_ENABLED=true`) and each visitor gets their own budget: 120 API requests per minute and 600 media range requests per minute (deliberately generous so normal playback never trips it). Exceeding it returns a clean "slow down" response instead of choking the server.
+**Rate limiting you control.** Off by default — your personal instance, your call. If you ever share the addon link with a group, turn it on (one checkbox in the wizard or `RATE_LIMIT_ENABLED=true`) and each visitor gets their own token bucket: 120 API requests per minute (burst 30) and 600 media range requests per minute (burst 120), plus a cap on simultaneous streams per IP. The burst allowance is what lets a player reopen several ranges right after a seek without getting a 429, while still keeping a single visitor from draining the server. Exceeding it returns a clean "slow down" response instead of choking the server.
 
 **Watch history.** Every stream gets start, seek and stop events recorded. A session that sits idle for 10 minutes is treated as stopped. Anything between roughly 1% and 95% watched shows up in the Continue Watching rows, with progress and play counts. For episodic videos, the entry links back to the collection's part list with the last-watched item noted.
 
@@ -154,7 +154,7 @@ This is the part designed for people who don't want to touch config files, and i
 1. Deploy the addon with no configuration at all. Yes, really — nothing is required up front.
 2. Open `https://your-deployed-url/configure` in a browser.
 3. **On first visit** the page asks you to *claim* it by setting an owner password. From that moment on, only that password opens the page. Anyone else who stumbles on the URL sees a lock screen, nothing more.
-4. Fill in the form: API ID and Hash, your session string (or bot token), your channel IDs, and whatever optional extras you want — TMDB key and language, log channel, timezone, the manifest password (`API_KEY`), rate limit toggle, search cache duration.
+4. Fill in the form: API ID and Hash, your session string(s) (or bot token), your channel IDs, and whatever optional extras you want — TMDB key and language, log channel, timezone, the manifest password (`API_KEY`), rate limit toggle, search cache duration.
 5. Hit **Test Telegram connection**. It checks your credentials against Telegram for real and tells you who you're logged in as. Takes about 15 seconds.
 6. Hit **Save & apply**. The settings are validated, written to `data/config.json`, and the Telegram client restarts with the new values — no redeploy, no rebuild, no waiting.
 
@@ -215,14 +215,38 @@ The addon finds your files by reading file names and message captions. The clean
 
 ## Telegram credentials: bot token vs. user session
 
-The addon can log into Telegram two ways, and the difference matters a lot for streaming. my advice is to use both bot token and user session for best experience.  
+The addon can log into Telegram with a user session or a bot token, and the difference matters a lot for streaming. My advice is to configure **both**: the session string (or several) does the heavy lifting, and the bot token stays connected as a fallback if every session expires.
+
+`TG_AUTH_MODE` decides how they are used:
+
+| Mode | Behaviour |
+| :--- | :--- |
+| `auto` (default) | Use all configured user sessions; keep the bot connected. If every session fails to start, fall back to the bot automatically. |
+| `user` | User sessions only. The bot token is ignored. |
+| `bot` | Bot token only. Small files and direct playback, but channel history search is unavailable to bots. |
 
 > [!IMPORTANT]
-> **Use a user session string if you can.** Bots are limited to 2GB files, get throttled hard by Telegram, and are generally flaky for streaming large files. A user session handles files up to 4GB, downloads faster, and is far more stable. It's what I use personally.
+> **Use a user session string if you can.** Bots are severely restricted for media: Telegram's Bot API caps downloads at 20 MB, and bot accounts are also rate-limited more aggressively. A user session streams large files (up to 2 GB for regular accounts, 4 GB for Premium) without those limits. The addon uses a configurable 20 MB guard (`BOT_FILE_LIMIT_MB`) and returns a clear error instead of a broken stream when only a bot is available.
 
-**Bot token** — what it is: a token from [@BotFather](https://t.me/BotFather). The catch: Telegram enforces a hard 2GB limit on bot downloads, and connection rates are throttled. Files over 2GB simply won't stream. Setup: the bot must be an **administrator** of your channel so it can read messages.
+**Bot token** — what it is: a token from [@BotFather](https://t.me/BotFather). Setup: the bot must be an **administrator** of your channel so it can read messages. Useful as a fallback for playback, but not a substitute for a session when you have large files.
 
-**User session** — what it is: a string that represents your own Telegram account login. The upside: no 2GB wall (up to 4GB), faster speeds, no throttling drama. Setup: your account just needs to be a member of the channel. No admin rights needed.
+**User session** — what it is: a string that represents your own Telegram account login. The upside: no bot download wall, faster speeds, no throttling drama, and channel history search works. Setup: your account just needs to be a member of the channel. No admin rights needed.
+
+### Multiple user sessions (streaming rotation)
+
+You can configure more than one user account. Add the primary to `USER_SESSION_STRING` and extra strings to `USER_SESSION_STRINGS` (one per line or comma-separated). Numbered variables such as `USER_SESSION_STRING_2` and `USER_SESSION_STRING_3` also work.
+
+The addon starts every session and rotates 1 MiB stream chunks across the ones that connected successfully. Each account gets its own live message and file reference, because Telegram file references are account-bound. This spreads per-account `FloodWait`, lets concurrent viewers use different accounts, and helps when one large split file would otherwise hammer a single session. A failed session is skipped automatically in `auto` mode; if every session fails, the bot token is used as the fallback.
+
+> [!IMPORTANT]
+> Extra sessions do **not** increase the maximum size of a single Telegram file. Telegram itself caps uploads at 2 GB (regular) or 4 GB (Premium), so a larger video must already exist as split parts. The addon stitches those parts into one stream and rotates the part downloads across your sessions.
+
+> [!TIP]
+> Use session strings from **different Telegram accounts**. Two sessions of the same account still work, but they share that account's rate limits, so rotation cannot spread the load. If one account is a Premium account, a file larger than 2 GB can still stream by falling back to that session when the regular account is refused.
+
+### How streaming works
+
+Playback uses a parallel read-ahead pipeline: up to `TG_STREAM_PREFETCH` 1 MiB chunks (default 4) are fetched concurrently, so a high-bitrate file is not limited by one request/response round trip. With multiple sessions configured, consecutive chunks rotate across accounts; raise `TG_STREAM_PREFETCH` (for example to 6–8) if you want more requests in flight across those accounts. Expired Telegram file references are refreshed transparently per account, `FloodWait` is honoured with a per-session cooldown (other sessions keep streaming), and transient network errors are retried up to `TG_STREAM_MAX_RETRIES` times. HTTP range requests support `bytes=start-end`, `bytes=start-` and suffix ranges (`bytes=-N`); malformed or unsatisfiable ranges get a proper `416`. Live message references are cached for `TG_STREAM_MESSAGE_TTL` seconds to cut down on `getMessages` calls.
 
 > [!CAUTION]
 > **Treat your session string like a password to your whole Telegram account.** Anyone holding it can read and write your chats.
@@ -311,8 +335,17 @@ You can set everything through the [wizard](#the-configuration-wizard) and skip 
 | `API_ID` | Yes* | Telegram API ID from [my.telegram.org](https://my.telegram.org). |
 | `API_HASH` | Yes* | Telegram API Hash from the same place. |
 | `TELEGRAM_CHANNEL_ID` | Yes* | Channel IDs / usernames, comma-separated. |
-| `USER_SESSION_STRING` | — | User session string. Recommended over a bot token. |
-| `BOT_TOKEN` | — | Bot token from @BotFather. Use this *or* a session string (session wins). |
+| `USER_SESSION_STRING` | — | Primary user session string. Recommended over a bot token. |
+| `USER_SESSION_STRINGS` | No | Extra user session strings for stream rotation (one per line or comma-separated). Numbered `USER_SESSION_STRING_2`, `_3`, ... also work. |
+| `BOT_TOKEN` | — | Bot token from @BotFather. In `auto` mode it is the fallback when no session is available. |
+| `TG_AUTH_MODE` | No | `auto` (default), `user` or `bot`. Controls which credential is used. |
+| `BOT_FILE_LIMIT_MB` | No | Bot-only download guard in MB (default `20`, `0` disables). |
+| `TG_STREAM_PREFETCH` | No | Parallel 1 MiB chunk prefetch per stream (default `4`, range 1–16). |
+| `TG_STREAM_MAX_RETRIES` | No | Retry attempts for transient Telegram read errors (default `3`). |
+| `TG_STREAM_MESSAGE_TTL` | No | Seconds a live message/file reference is reused (default `240`). |
+| `TG_SEARCH_CONCURRENCY` | No | Concurrent Telegram searches (default `2`). |
+| `TG_SEARCH_MIN_INTERVAL` | No | Minimum seconds between Telegram search calls (default `0.35`). |
+| `TG_FLOOD_WAIT_MAX` | No | Maximum seconds to honour a Telegram `FloodWait` before giving up (default `120`). |
 | `ADDON_URL` | Yes* | Public URL of your deployed app, e.g. `https://myaddon.onrender.com`. |
 | `API_KEY` | No | Extra password for the manifest URL (`https://your-domain/YOUR_KEY/manifest.json`) so strangers can't use your addon. |
 | `CONFIG_PASSWORD` | No | Password for the `/configure` wizard. If unset, the first visitor claims it. |
@@ -325,6 +358,10 @@ You can set everything through the [wizard](#the-configuration-wizard) and skip 
 | `RATE_LIMIT_REQUESTS` | No | API requests per window per IP (default `120`). |
 | `RATE_LIMIT_WINDOW` | No | Rate limit window in seconds (default `60`). |
 | `RATE_LIMIT_STREAM_REQUESTS` | No | Media range requests per window per IP (default `600`). |
+| `RATE_LIMIT_BURST` | No | Token-bucket burst for API requests (default `30`). |
+| `RATE_LIMIT_STREAM_BURST` | No | Token-bucket burst for media requests (default `120`). |
+| `RATE_LIMIT_STREAM_CONCURRENCY` | No | Simultaneous streams per IP (default `8`, `0` disables). |
+| `TRUST_PROXY_HEADERS` | No | Read `X-Forwarded-For`/`X-Real-IP` (default `true`; set `false` when exposed directly). |
 | `CACHE_TTL` | No | Search cache duration in seconds (default `1800` = 30 minutes). |
 | `DATA_DIR` | No | Where the SQLite cache and wizard config live (default `./data`). Mount it as a volume to survive restarts. |
 | `PORT` | No | Server port (default `7860`). |
