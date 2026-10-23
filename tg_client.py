@@ -394,6 +394,9 @@ class TelegramClientManager:
         self._client_bad_until = {}      # id(client) -> ts; skip accounts that cannot read a chat
         self._peer_watch_task = None
         self._stream_cursor = 0
+        # Per-message/per-account stream counters for diagnosing chunk rotation.
+        self._stream_stats = {}
+        self._stream_stats_lock = asyncio.Lock()
         self._log_cache = {}
         self._refresh_locks = {}
         self._refresh_ts = {}
@@ -1477,6 +1480,65 @@ class TelegramClientManager:
                     logger.debug(f"Error closing chunk generator: {close_err}")
         return b""
 
+    async def _record_stream_chunk(self, client: Client, message: Message,
+                                  index: int, byte_count: int):
+        """Track successful chunk downloads and emit low-noise live account stats."""
+        if byte_count <= 0:
+            return
+
+        chat_id, message_id = self._message_identity(message)
+        client_id = id(client)
+        key = (chat_id, message_id, client_id)
+        now = time.monotonic()
+        label = self._client_label(client)
+
+        async with self._stream_stats_lock:
+            # Keep this diagnostic-only cache bounded when many files are played.
+            stale_before = now - 3600
+            for old_key, old_stats in list(self._stream_stats.items()):
+                if old_stats["last_activity"] < stale_before:
+                    self._stream_stats.pop(old_key, None)
+
+            stats = self._stream_stats.get(key)
+            if stats is None:
+                stats = {
+                    "label": label,
+                    "bytes": 0,
+                    "chunks": 0,
+                    "started": now,
+                    "last_log": 0.0,
+                    "last_log_bytes": 0,
+                    "last_activity": now,
+                }
+                self._stream_stats[key] = stats
+
+            stats["bytes"] += byte_count
+            stats["chunks"] += 1
+            stats["last_activity"] = now
+
+            # Log the first successful chunk and then at most once every 5 seconds
+            # per account/file, avoiding one INFO line per 1 MiB chunk.
+            elapsed_since_log = now - stats["last_log"]
+            if stats["last_log"] == 0.0 or elapsed_since_log >= 5.0:
+                interval_bytes = stats["bytes"] - stats["last_log_bytes"]
+                if stats["last_log"] == 0.0:
+                    # The first sample has no meaningful elapsed download interval yet.
+                    interval_speed = 0.0
+                    average_speed = 0.0
+                else:
+                    interval_speed = interval_bytes / max(elapsed_since_log, 0.001) / (1024 * 1024)
+                    average_speed = stats["bytes"] / max(now - stats["started"], 0.001) / (1024 * 1024)
+                logger.info(
+                    f"[STREAM-STATS] account={stats['label']} chat={chat_id} "
+                    f"message={message_id} chunk={index} "
+                    f"total={stats['bytes'] / (1024 * 1024):.2f} MiB "
+                    f"chunks={stats['chunks']} "
+                    f"speed={interval_speed:.2f} MiB/s "
+                    f"avg={average_speed:.2f} MiB/s"
+                )
+                stats["last_log"] = now
+                stats["last_log_bytes"] = stats["bytes"]
+
     async def _ensure_stream_state(self, client: Client, source: Message,
                                    state: dict, file_size: int):
         """Populate one account's file id (file references are account-bound)."""
@@ -1548,9 +1610,13 @@ class TelegramClientManager:
             for attempt in range(attempts):
                 try:
                     await self._ensure_stream_state(candidate, message, state, file_size)
-                    return await self._fetch_chunk(
+                    chunk = await self._fetch_chunk(
                         candidate, state["file_id"], file_size, index
                     )
+                    await self._record_stream_chunk(
+                        candidate, message, index, len(chunk)
+                    )
+                    return chunk
                 except asyncio.CancelledError:
                     raise
                 except FloodWait as e:
