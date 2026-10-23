@@ -12,6 +12,7 @@ from pyrogram.types import Message
 from pyrogram.session.auth import Auth
 from pyrogram.session import Session
 from pyrogram.file_id import FileId, FileType, ThumbnailSource
+from pyrogram import utils as pyro_utils
 from pyrogram.errors import VolumeLocNotFound, CDNFileHashMismatch, FloodWait
 from pyrogram.crypto import aes
 import pyrogram
@@ -666,7 +667,28 @@ class TelegramClientManager:
             # Resolve target channels on startup to avoid PeerIdInvalid errors
             await self._resolve_channels()
 
-    async def _resolve_channels_for_client(self, slot: _SessionSlot, chat_ids: list):
+    async def _seed_bot_peer(self, bot_client: Client, seed_client: Client, chat_id) -> bool:
+        """Teach a bot a channel's access hash using a user session.
+
+        A fresh in-memory bot session has no peer cache and (with
+        ``no_updates``) never receives updates, so Pyrogram cannot resolve a
+        private channel id on its own and raises ``Peer id invalid``. The
+        channel's access hash is read from a user session and stored in the
+        bot's peer cache; the following ``get_chat`` then proves whether the
+        bot really is a participant (otherwise Telegram rejects it).
+        """
+        peer = await seed_client.resolve_peer(chat_id)
+        channel_id = getattr(peer, "channel_id", None)
+        access_hash = getattr(peer, "access_hash", None)
+        if channel_id is None or access_hash is None:
+            return False
+        peer_id = pyro_utils.get_channel_id(channel_id)
+        await bot_client.storage.update_peers([(peer_id, access_hash, "channel", None, None)])
+        await bot_client.get_chat(chat_id)
+        return True
+
+    async def _resolve_channels_for_client(self, slot: _SessionSlot, chat_ids: list,
+                                           seed_client: Client = None):
         client = slot.client
         try:
             if not slot.is_bot:
@@ -691,7 +713,24 @@ class TelegramClientManager:
                     except (TypeError, ValueError):
                         slot.chats_ok.add(chat_id)
                 except Exception as e:
-                    hint = " (bot must be an admin of the channel)" if slot.is_bot else ""
+                    if slot.is_bot and seed_client is not None:
+                        try:
+                            if await self._seed_bot_peer(client, seed_client, chat_id):
+                                try:
+                                    slot.chats_ok.add(int(chat_id))
+                                except (TypeError, ValueError):
+                                    slot.chats_ok.add(chat_id)
+                                logger.info(
+                                    f"[{slot.label}] Resolved channel {chat_id} "
+                                    "(peer seeded from the user session)"
+                                )
+                                continue
+                        except Exception as seed_err:
+                            e = f"{e}; after seeding the peer: {seed_err}"
+                    hint = (
+                        " (the bot must be an admin of this exact channel, and the BOT_TOKEN "
+                        "must belong to that bot)" if slot.is_bot else ""
+                    )
                     logger.warning(f"[{slot.label}] Failed to cache channel {chat_id}: {e}{hint}")
             slot.chats_checked = True
             if slot.is_bot and chat_ids and not slot.chats_ok:
@@ -713,11 +752,20 @@ class TelegramClientManager:
     async def _resolve_channels(self):
         try:
             chat_ids = self.get_channel_ids()
-            slots = self._all_ready_slots()
-            if not slots:
+            user_slots = self._ready_user_slots()
+            bot_slots = self._ready_bot_slots()
+            if not user_slots and not bot_slots:
                 return
+            # User sessions first: they can see the channel and hand its access
+            # hash to the bots, which cannot resolve private channels on their own.
             await asyncio.gather(
-                *(self._resolve_channels_for_client(slot, chat_ids) for slot in slots),
+                *(self._resolve_channels_for_client(slot, chat_ids) for slot in user_slots),
+                return_exceptions=True,
+            )
+            seed_client = user_slots[0].client if user_slots else None
+            await asyncio.gather(
+                *(self._resolve_channels_for_client(slot, chat_ids, seed_client=seed_client)
+                  for slot in bot_slots),
                 return_exceptions=True,
             )
         except Exception as e:
