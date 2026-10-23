@@ -244,6 +244,9 @@ Add the primary bot to `BOT_TOKEN` and extra bots to `BOT_TOKENS` (one per line 
 
 With `TG_BOT_STREAMING=true` (default) every connected bot joins the same chunk rotation as the user sessions, so 2 user sessions + 2 bots means four accounts share the load and four separate `FloodWait` budgets. A bot that is not an admin of the channel being streamed is left out, and a client that starts failing with access errors is parked for 5 minutes while the others continue. Set `TG_BOT_STREAMING=false` to keep bots as a pure fallback.
 
+> [!NOTE]
+> **Bots and private channels.** A bot cannot look up a private channel by ID; Telegram only hands it the channel (and its access hash) in an update. The addon keeps updates enabled for bot clients and re-checks every 20 seconds, so a bot joins the stream rotation as soon as Telegram delivers the channel, for example when anything is posted in it. The startup log asks the HTTP Bot API whether the bot really is an admin and tells you which case you are in. Public channels (with a username) resolve immediately.
+
 > [!IMPORTANT]
 > Extra sessions do **not** increase the maximum size of a single Telegram file. Telegram itself caps uploads at 2 GB (regular) or 4 GB (Premium), so a larger video must already exist as split parts. The addon stitches those parts into one stream and rotates the part downloads across your sessions.
 

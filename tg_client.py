@@ -369,6 +369,7 @@ class _SessionSlot:
         # can actually read). ``chats_checked`` stays False until then.
         self.chats_ok = set()
         self.chats_checked = False
+        self.token = None  # bot token (never logged); used for the Bot API admin check
 
 
 class TelegramClientManager:
@@ -391,6 +392,7 @@ class TelegramClientManager:
         self._client_message_locks = {}
         self._client_flood_until = {}
         self._client_bad_until = {}      # id(client) -> ts; skip accounts that cannot read a chat
+        self._peer_watch_task = None
         self._stream_cursor = 0
         self._log_cache = {}
         self._refresh_locks = {}
@@ -555,22 +557,26 @@ class TelegramClientManager:
             logger.info(
                 f"Initializing Telegram bot client {index}/{len(bot_tokens)} (bot token)..."
             )
+            # Bots keep updates ON (with a single worker): a bot can only learn
+            # the access hash of a private channel from an update that carries
+            # it, and a fresh in-memory session has no peer cache.
             client = self._new_client(
                 name=f"tg_stremio_bot_{index}",
                 api_id=Config.API_ID,
                 api_hash=Config.API_HASH,
                 bot_token=token,
                 in_memory=True,
-                no_updates=True,
+                no_updates=False,
+                workers=1,
             )
             self.bot_clients.append(client)
-            self._bot_slots.append(
-                _SessionSlot(
-                    client,
-                    f"bot {index}" if len(bot_tokens) > 1 else "bot token",
-                    is_bot=True,
-                )
+            bot_slot = _SessionSlot(
+                client,
+                f"bot {index}" if len(bot_tokens) > 1 else "bot token",
+                is_bot=True,
             )
+            bot_slot.token = token
+            self._bot_slots.append(bot_slot)
 
         if not self._user_slots and not self._bot_slots:
             raise ValueError(
@@ -677,6 +683,21 @@ class TelegramClientManager:
         bot's peer cache; the following ``get_chat`` then proves whether the
         bot really is a participant (otherwise Telegram rejects it).
         """
+        # Public channels: the bot can resolve the username itself and gets its
+        # own access hash that way.
+        try:
+            seed_chat = await seed_client.get_chat(chat_id)
+            username = getattr(seed_chat, "username", None)
+        except Exception:
+            username = None
+        if username:
+            try:
+                await bot_client.get_chat(username)
+                await bot_client.get_chat(chat_id)
+                return True
+            except Exception:
+                pass
+
         peer = await seed_client.resolve_peer(chat_id)
         channel_id = getattr(peer, "channel_id", None)
         access_hash = getattr(peer, "access_hash", None)
@@ -686,6 +707,89 @@ class TelegramClientManager:
         await bot_client.storage.update_peers([(peer_id, access_hash, "channel", None, None)])
         await bot_client.get_chat(chat_id)
         return True
+
+    async def _bot_api_diagnosis(self, slot: _SessionSlot, chat_id) -> str:
+        """Ask the HTTP Bot API whether this bot is really an admin of the chat.
+
+        Diagnostic only. The token is never logged; failures are swallowed.
+        """
+        token = getattr(slot, "token", None)
+        if not token:
+            return ""
+        try:
+            import httpx
+            # httpx logs full request URLs at INFO, and this URL carries the
+            # bot token: keep those loggers quiet so it never reaches the logs.
+            for noisy in ("httpx", "httpcore"):
+                logging.getLogger(noisy).setLevel(logging.WARNING)
+            bot_id = int(str(token).split(":", 1)[0])
+            async with httpx.AsyncClient(timeout=8.0) as http:
+                resp = await http.get(
+                    f"https://api.telegram.org/bot{token}/getChatMember",
+                    params={"chat_id": str(chat_id), "user_id": bot_id},
+                )
+            data = resp.json()
+        except Exception as e:
+            return f"(Bot API admin check unavailable: {type(e).__name__})"
+        if data.get("ok"):
+            status = (data.get("result") or {}).get("status")
+            if status in ("administrator", "creator"):
+                return (
+                    f"[{slot.label}] The Bot API confirms this bot IS an admin of {chat_id}. "
+                    "Telegram just has not delivered that channel to the bot yet: post any "
+                    "message (or upload a file) in the channel and the bot joins the stream "
+                    "rotation automatically."
+                )
+            return (
+                f"[{slot.label}] The Bot API reports status '{status}' for this bot in "
+                f"{chat_id}: make it an administrator of that channel."
+            )
+        desc = str(data.get("description") or "unknown error")
+        return (
+            f"[{slot.label}] The Bot API cannot see this bot in {chat_id} ({desc}). "
+            "Check that BOT_TOKEN belongs to the bot you added, and that it is an admin "
+            "of this exact channel."
+        )
+
+    def _bot_missing_chats(self, slot: _SessionSlot) -> list:
+        missing = []
+        for chat_id in self.get_channel_ids():
+            if isinstance(chat_id, int) and chat_id not in slot.chats_ok:
+                missing.append(chat_id)
+        return missing
+
+    async def _bot_peer_watch(self):
+        """Verify bots as soon as Telegram delivers the channel to them.
+
+        Bots learn private channels from updates. Poll the (local, free) peer
+        cache and verify with get_chat once the channel shows up.
+        """
+        try:
+            while self.is_running:
+                pending = [s for s in self._ready_bot_slots() if self._bot_missing_chats(s)]
+                if not pending:
+                    return
+                await asyncio.sleep(20)
+                for slot in pending:
+                    for chat_id in self._bot_missing_chats(slot):
+                        try:
+                            await slot.client.storage.get_peer_by_id(chat_id)
+                        except KeyError:
+                            continue
+                        try:
+                            await slot.client.get_chat(chat_id)
+                        except Exception as e:
+                            logger.debug(f"[{slot.label}] channel {chat_id} still not usable: {e}")
+                            continue
+                        slot.chats_ok.add(chat_id)
+                        logger.info(
+                            f"[{slot.label}] Resolved channel {chat_id} from a channel update; "
+                            "bot joins the stream rotation."
+                        )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"Bot peer watcher stopped: {e}")
 
     async def _resolve_channels_for_client(self, slot: _SessionSlot, chat_ids: list,
                                            seed_client: Client = None):
@@ -732,11 +836,15 @@ class TelegramClientManager:
                         "must belong to that bot)" if slot.is_bot else ""
                     )
                     logger.warning(f"[{slot.label}] Failed to cache channel {chat_id}: {e}{hint}")
+                    if slot.is_bot:
+                        diagnosis = await self._bot_api_diagnosis(slot, chat_id)
+                        if diagnosis:
+                            logger.warning(diagnosis)
             slot.chats_checked = True
             if slot.is_bot and chat_ids and not slot.chats_ok:
                 logger.warning(
-                    f"[{slot.label}] cannot access any configured channel; "
-                    "it will not be used for streaming. Add the bot as an admin."
+                    f"[{slot.label}] cannot access any configured channel yet; "
+                    "it is not used for streaming until it can (re-checked every 20 s)."
                 )
 
             if Config.LOG_CHANNEL_ID:
@@ -768,6 +876,10 @@ class TelegramClientManager:
                   for slot in bot_slots),
                 return_exceptions=True,
             )
+            if any(self._bot_missing_chats(slot) for slot in bot_slots):
+                task = self._peer_watch_task
+                if task is None or task.done():
+                    self._peer_watch_task = asyncio.create_task(self._bot_peer_watch())
         except Exception as e:
             logger.warning(f"Failed to resolve target channels on startup: {e}")
 
@@ -775,6 +887,14 @@ class TelegramClientManager:
         if (not self.is_running and not self._user_slots and not self._bot_slots):
             return
         logger.info("Stopping Pyrogram client(s)...")
+        task = self._peer_watch_task
+        self._peer_watch_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
         clients = [slot.client for slot in self._user_slots + self._bot_slots]
         for client in clients:
             try:
