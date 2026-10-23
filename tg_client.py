@@ -706,7 +706,11 @@ class TelegramClientManager:
         access_hash = getattr(peer, "access_hash", None)
         if channel_id is None or access_hash is None:
             return False
-        peer_id = pyro_utils.get_channel_id(channel_id)
+        # Pyrogram storage uses marked peer IDs (-100<channel_id>) as its key.
+        # ``channel_id`` above is already the raw positive channel ID from
+        # InputPeerChannel; get_channel_id() is the inverse conversion and would
+        # truncate it, causing CHANNEL_INVALID even when the bot is an admin.
+        peer_id = int(f"-100{channel_id}")
         await bot_client.storage.update_peers([(peer_id, access_hash, "channel", None, None)])
         await bot_client.get_chat(chat_id)
         return True
