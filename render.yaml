@@ -17,6 +17,9 @@ services:
       - key: BOT_TOKEN
         sync: false
         placeholder: "Your Telegram Bot Token (from BotFather)"
+      - key: BOT_TOKENS
+        sync: false
+        placeholder: "Optional extra bot tokens for stream rotation (one per line or comma-separated)"
       - key: TELEGRAM_CHANNEL_ID
         sync: false
         placeholder: "Your private channel ID (starts with -100)"

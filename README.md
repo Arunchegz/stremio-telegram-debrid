@@ -215,20 +215,20 @@ The addon finds your files by reading file names and message captions. The clean
 
 ## Telegram credentials: bot token vs. user session
 
-The addon can log into Telegram with a user session or a bot token, and the difference matters a lot for streaming. My advice is to configure **both**: the session string (or several) does the heavy lifting, and the bot token stays connected as a fallback if every session expires.
+The addon can log into Telegram with a user session or a bot token, and the difference matters a lot for streaming. My advice is to configure **both**: the session string(s) and the bot token(s) all take part in the streaming rotation, and the bots keep playback alive if every session expires.
 
 `TG_AUTH_MODE` decides how they are used:
 
 | Mode | Behaviour |
 | :--- | :--- |
-| `auto` (default) | Use all configured user sessions; keep the bot connected. If every session fails to start, fall back to the bot automatically. |
-| `user` | User sessions only. The bot token is ignored. |
-| `bot` | Bot token only. Small files and direct playback, but channel history search is unavailable to bots. |
+| `auto` (default) | Use all configured user sessions and bot tokens for streaming (see `TG_BOT_STREAMING`). If every session fails to start, the bots carry everything. |
+| `user` | User sessions only. Bot tokens are ignored. |
+| `bot` | Bot tokens only. Playback works, but channel history search is unavailable to bots. |
 
 > [!IMPORTANT]
-> **Use a user session string if you can.** Bots are severely restricted for media: Telegram's Bot API caps downloads at 20 MB, and bot accounts are also rate-limited more aggressively. A user session streams large files (up to 2 GB for regular accounts, 4 GB for Premium) without those limits. The addon uses a configurable 20 MB guard (`BOT_FILE_LIMIT_MB`) and returns a clear error instead of a broken stream when only a bot is available.
+> **Keep at least one user session string.** Bots cannot search channel history, so catalogs and search need a user session. For streaming, the addon talks to Telegram over MTProto (Pyrogram), where bots can read large files; the 20 MB limit only applies to the HTTP Bot API. Bot accounts may be rate-limited more aggressively than users, which is why several of them are rotated. `BOT_FILE_LIMIT_MB` is an optional guard (default `0`, off) for bot-only setups.
 
-**Bot token** — what it is: a token from [@BotFather](https://t.me/BotFather). Setup: the bot must be an **administrator** of your channel so it can read messages. Useful as a fallback for playback, but not a substitute for a session when you have large files.
+**Bot token** — what it is: a token from [@BotFather](https://t.me/BotFather). Setup: the bot must be an **administrator** of your channel so it can read messages. A bot that cannot read a channel is skipped for streams from that channel.
 
 **User session** — what it is: a string that represents your own Telegram account login. The upside: no bot download wall, faster speeds, no throttling drama, and channel history search works. Setup: your account just needs to be a member of the channel. No admin rights needed.
 
@@ -236,7 +236,13 @@ The addon can log into Telegram with a user session or a bot token, and the diff
 
 You can configure more than one user account. Add the primary to `USER_SESSION_STRING` and extra strings to `USER_SESSION_STRINGS` (one per line or comma-separated). Numbered variables such as `USER_SESSION_STRING_2` and `USER_SESSION_STRING_3` also work.
 
-The addon starts every session and rotates 1 MiB stream chunks across the ones that connected successfully. Each account gets its own live message and file reference, because Telegram file references are account-bound. This spreads per-account `FloodWait`, lets concurrent viewers use different accounts, and helps when one large split file would otherwise hammer a single session. A failed session is skipped automatically in `auto` mode; if every session fails, the bot token is used as the fallback.
+The addon starts every session and rotates 1 MiB stream chunks across the ones that connected successfully. Each account gets its own live message and file reference, because Telegram file references are account-bound. This spreads per-account `FloodWait`, lets concurrent viewers use different accounts, and helps when one large split file would otherwise hammer a single session. A failed session is skipped automatically in `auto` mode; if every session fails, the bot tokens carry the stream.
+
+### Multiple bot tokens (streaming rotation)
+
+Add the primary bot to `BOT_TOKEN` and extra bots to `BOT_TOKENS` (one per line or comma-separated); `BOT_TOKEN_2`, `BOT_TOKEN_3`, ... also work. Create each bot with @BotFather and add it as an **administrator** of every media channel.
+
+With `TG_BOT_STREAMING=true` (default) every connected bot joins the same chunk rotation as the user sessions, so 2 user sessions + 2 bots means four accounts share the load and four separate `FloodWait` budgets. A bot that is not an admin of the channel being streamed is left out, and a client that starts failing with access errors is parked for 5 minutes while the others continue. Set `TG_BOT_STREAMING=false` to keep bots as a pure fallback.
 
 > [!IMPORTANT]
 > Extra sessions do **not** increase the maximum size of a single Telegram file. Telegram itself caps uploads at 2 GB (regular) or 4 GB (Premium), so a larger video must already exist as split parts. The addon stitches those parts into one stream and rotates the part downloads across your sessions.
@@ -337,9 +343,11 @@ You can set everything through the [wizard](#the-configuration-wizard) and skip 
 | `TELEGRAM_CHANNEL_ID` | Yes* | Channel IDs / usernames, comma-separated. |
 | `USER_SESSION_STRING` | — | Primary user session string. Recommended over a bot token. |
 | `USER_SESSION_STRINGS` | No | Extra user session strings for stream rotation (one per line or comma-separated). Numbered `USER_SESSION_STRING_2`, `_3`, ... also work. |
-| `BOT_TOKEN` | — | Bot token from @BotFather. In `auto` mode it is the fallback when no session is available. |
+| `BOT_TOKEN` | — | Primary bot token from @BotFather. Takes part in the streaming rotation in `auto` mode. |
+| `BOT_TOKENS` | No | Extra bot tokens for stream rotation (one per line or comma-separated). Numbered `BOT_TOKEN_2`, `_3`, ... also work. Bots must be channel admins. |
+| `TG_BOT_STREAMING` | No | `true` (default): bots carry stream chunks next to the user sessions. `false`: bots are only a fallback. |
 | `TG_AUTH_MODE` | No | `auto` (default), `user` or `bot`. Controls which credential is used. |
-| `BOT_FILE_LIMIT_MB` | No | Bot-only download guard in MB (default `20`, `0` disables). |
+| `BOT_FILE_LIMIT_MB` | No | Optional bot-only download guard in MB (default `0` = off). |
 | `TG_STREAM_PREFETCH` | No | Parallel 1 MiB chunk prefetch per stream (default `4`, range 1–16). |
 | `TG_STREAM_MAX_RETRIES` | No | Retry attempts for transient Telegram read errors (default `3`). |
 | `TG_STREAM_MESSAGE_TTL` | No | Seconds a live message/file reference is reused (default `240`). |

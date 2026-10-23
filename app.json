@@ -31,7 +31,15 @@
       "required": false
     },
     "BOT_TOKEN": {
-      "description": "Bot token from @BotFather (fallback if USER_SESSION_STRING is not used)",
+      "description": "Primary bot token from @BotFather (joins the streaming rotation; must be a channel admin)",
+      "required": false
+    },
+    "BOT_TOKENS": {
+      "description": "Optional extra bot tokens for stream rotation (one per line or comma-separated)",
+      "required": false
+    },
+    "TG_BOT_STREAMING": {
+      "description": "true (default): bots carry stream chunks with the user sessions; false: bots are only a fallback",
       "required": false
     },
     "TG_AUTH_MODE": {
@@ -43,7 +51,7 @@
       "required": false
     },
     "BOT_FILE_LIMIT_MB": {
-      "description": "Bot-only download guard in MB (default: 20, 0 disables)",
+      "description": "Optional bot-only download guard in MB (default: 0 = off)",
       "required": false
     },
     "API_KEY": {

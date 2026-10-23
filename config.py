@@ -44,7 +44,11 @@ class Config:
 
     API_ID = os.getenv("API_ID")
     API_HASH = os.getenv("API_HASH")
+    # BOT_TOKEN is the primary bot. BOT_TOKENS may hold extra bots (one per line
+    # or comma separated); BOT_TOKEN_2, _3, ... work too. Every connected bot
+    # joins the streaming rotation next to the user sessions.
     BOT_TOKEN = os.getenv("BOT_TOKEN")
+    BOT_TOKENS = os.getenv("BOT_TOKENS", "")
     # USER_SESSION_STRING is the primary session. USER_SESSION_STRINGS may hold
     # extra sessions (one per line or comma separated) that are rotated across
     # streaming requests. Numbered env vars (USER_SESSION_STRING_2, _3, ...)
@@ -55,6 +59,11 @@ class Config:
     # auto = use the session string(s) when they work, keep the bot as fallback.
     # user / bot force a single credential type.
     TG_AUTH_MODE = os.getenv("TG_AUTH_MODE", "auto").strip().lower()
+
+    # When true (default) bot clients carry stream chunks together with the
+    # user sessions. When false, bots are only a fallback if every user
+    # session fails (the old behaviour).
+    TG_BOT_STREAMING = _env_bool("TG_BOT_STREAMING", "true")
 
     TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
     LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID")
@@ -80,9 +89,10 @@ class Config:
     TG_STREAM_MAX_RETRIES = _env_int("TG_STREAM_MAX_RETRIES", 3)
     TG_STREAM_RETRY_BACKOFF = _env_float("TG_STREAM_RETRY_BACKOFF", 0.5)
     TG_STREAM_MESSAGE_TTL = _env_int("TG_STREAM_MESSAGE_TTL", 240)  # reuse live message refs (seconds)
-    # Telegram bots cannot download arbitrarily large files with the Bot API.
-    # 0 disables the client-side guard.
-    BOT_FILE_LIMIT_MB = _env_int("BOT_FILE_LIMIT_MB", 20)
+    # Pyrogram talks MTProto, so bots can stream large files (the 20 MB cap
+    # belongs to the HTTP Bot API). Optional client-side guard for bot-only
+    # setups; 0 (default) disables it.
+    BOT_FILE_LIMIT_MB = _env_int("BOT_FILE_LIMIT_MB", 0)
 
     # --- Telegram API anti-flood (search) ---
     TG_SEARCH_CONCURRENCY = _env_int("TG_SEARCH_CONCURRENCY", 2)
@@ -122,6 +132,32 @@ class Config:
                     seen.add(token)
                     sessions.append(token)
         return sessions
+
+    @classmethod
+    def bot_tokens(cls) -> list:
+        """Return unique bot tokens in priority order.
+
+        Accepts ``BOT_TOKEN`` plus newline/comma/semicolon separated
+        ``BOT_TOKENS`` and numbered ``BOT_TOKEN_2`` ... ``BOT_TOKEN_8``.
+        Bot tokens look like ``123456:ABC-DEF`` and never contain whitespace
+        or those separators.
+        """
+        blobs = [
+            getattr(cls, "BOT_TOKEN", "") or "",
+            getattr(cls, "BOT_TOKENS", "") or "",
+        ]
+        for index in range(2, 9):
+            blobs.append(os.getenv(f"BOT_TOKEN_{index}", "") or "")
+
+        tokens = []
+        seen = set()
+        for blob in blobs:
+            for token in re.split(r"[\s,;]+", str(blob).strip()):
+                token = token.strip()
+                if token and token not in seen:
+                    seen.add(token)
+                    tokens.append(token)
+        return tokens
 
     @classmethod
     def apply_file_overrides(cls):
@@ -164,7 +200,7 @@ class Config:
             ("RATE_LIMIT_STREAM_REQUESTS", 600), ("RATE_LIMIT_BURST", 30),
             ("RATE_LIMIT_STREAM_BURST", 120), ("RATE_LIMIT_STREAM_CONCURRENCY", 8),
             ("TG_STREAM_PREFETCH", 4), ("TG_STREAM_MAX_RETRIES", 3),
-            ("TG_STREAM_MESSAGE_TTL", 240), ("BOT_FILE_LIMIT_MB", 20),
+            ("TG_STREAM_MESSAGE_TTL", 240), ("BOT_FILE_LIMIT_MB", 0),
             ("TG_SEARCH_CONCURRENCY", 2), ("TG_FLOOD_WAIT_MAX", 120),
         ):
             try:
@@ -190,6 +226,7 @@ class Config:
             cls.TG_SEARCH_MIN_INTERVAL = 0.35
 
         cls.RATE_LIMIT_ENABLED = _to_bool(cls.RATE_LIMIT_ENABLED)
+        cls.TG_BOT_STREAMING = _to_bool(getattr(cls, "TG_BOT_STREAMING", True))
         cls.WATCH_LOG_EVENTS = _to_bool(cls.WATCH_LOG_EVENTS)
         cls.TRUST_PROXY_HEADERS = _to_bool(cls.TRUST_PROXY_HEADERS)
 
@@ -200,6 +237,7 @@ class Config:
             cls.TG_AUTH_MODE = "auto"
 
         sessions = cls.session_strings()
+        bots = cls.bot_tokens()
         missing = []
         if not cls.API_ID:
             missing.append("API_ID")
@@ -209,9 +247,9 @@ class Config:
             if not sessions:
                 missing.append("USER_SESSION_STRING (TG_AUTH_MODE=user)")
         elif cls.TG_AUTH_MODE == "bot":
-            if not cls.BOT_TOKEN:
+            if not bots:
                 missing.append("BOT_TOKEN (TG_AUTH_MODE=bot)")
-        elif not cls.BOT_TOKEN and not sessions:
+        elif not bots and not sessions:
             missing.append("BOT_TOKEN or USER_SESSION_STRING")
         if not cls.TELEGRAM_CHANNEL_ID:
             missing.append("TELEGRAM_CHANNEL_ID")

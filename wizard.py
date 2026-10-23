@@ -221,9 +221,18 @@ def _render_wizard(values: dict, stats: dict, rate_enabled: bool, watch_logs: bo
         <div class="grid">
             {_field("USER_SESSION_STRING", "User Session String (recommended)", values, "", secret=True,
                     hint="Needed for large files, split parts and public channels. Generate with the session notebook in /deployment/colab")}
-            {_field("BOT_TOKEN", "Bot Token (fallback)", values, "123456:ABC-DEF...", secret=True,
-                    hint="Bot must be admin in the target channels")}
+            {_field("BOT_TOKEN", "Bot Token (primary)", values, "123456:ABC-DEF...", secret=True,
+                    hint="Bot must be admin in the target channels. Bots join the streaming rotation next to the user sessions")}
         </div>
+        <div class="grid">
+            {_field("BOT_TOKENS", "Additional Bot Tokens (optional)", values, "", secret=True,
+                    multiline=True, wide=True,
+                    hint="One bot token per line (or comma separated). Create each bot with @BotFather and make it an admin of your media channels. Every bot adds another FloodWait budget. Replace the whole masked value to change it.")}
+        </div>
+        <label class="toggle">
+            <input type="checkbox" id="f_TG_BOT_STREAMING" data-key="TG_BOT_STREAMING" {"checked" if Config.TG_BOT_STREAMING else ""}>
+            <span>Let bots carry stream chunks together with the user sessions (off = bots only act as fallback)</span>
+        </label>
         <div class="grid">
             {_field("USER_SESSION_STRINGS", "Additional User Sessions (optional)", values, "", secret=True,
                     multiline=True, wide=True,
@@ -245,8 +254,8 @@ def _render_wizard(values: dict, stats: dict, rate_enabled: bool, watch_logs: bo
                 </select>
                 <div class="hint">auto keeps the bot connected as a fallback if the session string expires</div>
             </div>
-            {_field("BOT_FILE_LIMIT_MB", "Bot-only file limit (MB)", values, "20", input_type="number",
-                    hint="Bot accounts cannot download large files. 0 disables the check")}
+            {_field("BOT_FILE_LIMIT_MB", "Bot-only file limit (MB)", values, "0", input_type="number",
+                    hint="Optional guard for bot-only setups. 0 (default) disables the check")}
         </div>
         <div class="grid">
             {_field("TG_STREAM_PREFETCH", "Parallel chunk prefetch", values, "4", input_type="number",
@@ -712,7 +721,20 @@ async def configure_test(request: Request):
 
     api_id = body.get("API_ID") or Config.API_ID
     api_hash = body.get("API_HASH") or Config.API_HASH
-    bot_token = body.get("BOT_TOKEN") or Config.BOT_TOKEN
+
+    # Configured bots first, then any new (non-masked) tokens typed in the wizard.
+    bot_blobs = list(Config.bot_tokens())
+    for key in ("BOT_TOKEN", "BOT_TOKENS"):
+        value = body.get(key)
+        if value and "••••" not in str(value):
+            bot_blobs.append(str(value))
+    bot_tokens = []
+    seen_bots = set()
+    for blob in bot_blobs:
+        for token in re.split(r"[\s,;]+", blob.strip()):
+            if token and token not in seen_bots:
+                seen_bots.add(token)
+                bot_tokens.append(token)
 
     # Start with the currently configured sessions, then add any new values
     # pasted into the wizard (masked placeholders are ignored).
@@ -734,7 +756,7 @@ async def configure_test(request: Request):
     except (TypeError, ValueError):
         return JSONResponse({"ok": False, "detail": "API_ID must be an integer"})
 
-    if not api_id or not api_hash or (not sessions and not bot_token):
+    if not api_id or not api_hash or (not sessions and not bot_tokens):
         return JSONResponse({"ok": False, "detail": "API_ID, API_HASH and (session string or bot token) are required"})
 
     def _masked_token(tok: str) -> str:
@@ -771,8 +793,9 @@ async def configure_test(request: Request):
     for index, session in enumerate(sessions, 1):
         label = "user session" if len(sessions) == 1 else f"user session {index}"
         probes.append(_probe(label, session_string=session))
-    if bot_token:
-        probes.append(_probe("bot token", bot_token=bot_token))
+    for index, token in enumerate(bot_tokens, 1):
+        label = "bot token" if len(bot_tokens) == 1 else f"bot {index}"
+        probes.append(_probe(label, bot_token=token))
     probe_results = await asyncio.gather(*probes) if probes else []
 
     ok_notes, failures = [], []
@@ -782,7 +805,7 @@ async def configure_test(request: Request):
     if ok_notes:
         message = " · ".join(ok_notes)
         if failures:
-            message += " · fallback failed: " + " · ".join(failures)
+            message += " · failed: " + " · ".join(failures)
         return JSONResponse({"ok": True, "user": message})
     return JSONResponse({"ok": False, "detail": " | ".join(failures) or "No credentials to test"})
 

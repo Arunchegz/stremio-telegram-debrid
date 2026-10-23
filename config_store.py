@@ -24,8 +24,8 @@ CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 
 # Keys that may be stored/edited via the wizard
 WIZARD_KEYS = [
-    "API_ID", "API_HASH", "BOT_TOKEN", "USER_SESSION_STRING", "USER_SESSION_STRINGS",
-    "TG_AUTH_MODE",
+    "API_ID", "API_HASH", "BOT_TOKEN", "BOT_TOKENS", "USER_SESSION_STRING", "USER_SESSION_STRINGS",
+    "TG_AUTH_MODE", "TG_BOT_STREAMING",
     "TELEGRAM_CHANNEL_ID", "LOG_CHANNEL_ID",
     "API_KEY", "ADDON_URL", "TIMEZONE",
     "TMDB_API_KEY", "TMDB_LANGUAGE",
@@ -43,11 +43,22 @@ _INT_KEYS = {
     "RATE_LIMIT_STREAM_CONCURRENCY", "TG_STREAM_PREFETCH", "TG_STREAM_MAX_RETRIES",
     "BOT_FILE_LIMIT_MB",
 }
-_BOOL_KEYS = {"RATE_LIMIT_ENABLED", "WATCH_LOG_EVENTS", "TRUST_PROXY_HEADERS"}
+_BOOL_KEYS = {"RATE_LIMIT_ENABLED", "WATCH_LOG_EVENTS", "TRUST_PROXY_HEADERS", "TG_BOT_STREAMING"}
 _SECRET_KEYS = {
-    "API_HASH", "BOT_TOKEN", "USER_SESSION_STRING", "USER_SESSION_STRINGS",
+    "API_HASH", "BOT_TOKEN", "BOT_TOKENS", "USER_SESSION_STRING", "USER_SESSION_STRINGS",
     "API_KEY", "TMDB_API_KEY", "CONFIG_PASSWORD",
 }
+
+
+def _bot_tokens_in(data: dict) -> list:
+    """Non-masked bot tokens found in BOT_TOKEN / BOT_TOKENS."""
+    tokens = []
+    for key in ("BOT_TOKEN", "BOT_TOKENS"):
+        value = str(data.get(key) or "")
+        if "••••" in value:
+            continue
+        tokens.extend(t for t in re.split(r"[\s,;]+", value.strip()) if t)
+    return tokens
 
 
 def _has_session_string(data: dict) -> bool:
@@ -173,6 +184,7 @@ def is_first_run() -> bool:
     # If the instance already has Telegram credentials or an API key configured,
     # NEVER allow an open first-run claim by random visitors on public deployments!
     if (os.getenv("API_ID") or os.getenv("API_KEY") or os.getenv("BOT_TOKEN")
+            or os.getenv("BOT_TOKENS")
             or os.getenv("USER_SESSION_STRING") or os.getenv("USER_SESSION_STRINGS")):
         return False
     return True
@@ -210,7 +222,9 @@ def validate_config_dict(data: dict) -> list:
         errors.append("API_HASH is required (get it from my.telegram.org).")
 
     has_sessions = _has_session_string(merged)
-    if not merged.get("BOT_TOKEN") and not has_sessions:
+    bot_tokens = _bot_tokens_in(merged)
+    has_bots = bool(bot_tokens)
+    if not has_bots and not has_sessions:
         errors.append("Either BOT_TOKEN or USER_SESSION_STRING is required.")
 
     auth_mode = str(merged.get("TG_AUTH_MODE") or "auto").strip().lower()
@@ -218,7 +232,7 @@ def validate_config_dict(data: dict) -> list:
         errors.append("TG_AUTH_MODE must be auto, user or bot.")
     elif auth_mode == "user" and not has_sessions:
         errors.append("TG_AUTH_MODE=user requires USER_SESSION_STRING.")
-    elif auth_mode == "bot" and not merged.get("BOT_TOKEN"):
+    elif auth_mode == "bot" and not has_bots:
         errors.append("TG_AUTH_MODE=bot requires BOT_TOKEN.")
 
     if not merged.get("TELEGRAM_CHANNEL_ID"):
@@ -229,7 +243,9 @@ def validate_config_dict(data: dict) -> list:
         if not url.startswith(("http://", "https://")):
             errors.append("ADDON_URL must start with http:// or https://")
 
-    if merged.get("BOT_TOKEN") and not str(merged["BOT_TOKEN"]).count(":") == 1:
-        errors.append("BOT_TOKEN format looks invalid (expected '123456:ABC-DEF...').")
+    for token in bot_tokens:
+        if token.count(":") != 1:
+            errors.append("A bot token looks invalid (expected '123456:ABC-DEF...').")
+            break
 
     return errors

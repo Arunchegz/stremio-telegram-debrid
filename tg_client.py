@@ -55,6 +55,19 @@ def _is_file_reference_error(exc: Exception) -> bool:
     return "filereference" in name or "file_reference" in text or "file reference" in text
 
 
+def _is_access_error(exc: Exception) -> bool:
+    """The account cannot see this chat/message (e.g. a bot that is not an admin)."""
+    blob = f"{type(exc).__name__} {exc}".lower()
+    return any(word in blob for word in (
+        "peeridinvalid", "peer_id_invalid", "channelinvalid", "channel_invalid",
+        "channelprivate", "channel_private", "chatadminrequired", "chat_admin_required",
+        "usernotparticipant", "user_not_participant", "chatforbidden", "channelforbidden",
+        "not available to this telegram session", "bot_method_invalid", "botmethodinvalid",
+        "authkeyunregistered", "auth_key_unregistered", "authkeyduplicated", "auth_key_duplicated",
+        "sessionrevoked", "session_revoked", "userdeactivated", "user_deactivated",
+    ))
+
+
 def _is_retryable_error(exc: Exception) -> bool:
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError)):
         return True
@@ -351,17 +364,22 @@ class _SessionSlot:
         self.label = label
         self.is_bot = is_bot
         self.ready = False
+        # Chats this account verified at startup (bots only stream chats they
+        # can actually read). ``chats_checked`` stays False until then.
+        self.chats_ok = set()
+        self.chats_checked = False
 
 
 class TelegramClientManager:
     def __init__(self):
         self.user_client = None          # first user client (backwards compatible)
         self.user_clients = []           # all configured user clients
-        self.bot_client = None
+        self.bot_client = None           # first bot client (backwards compatible)
+        self.bot_clients = []            # all configured bot clients
         self.client = None               # active primary client (backwards compatible)
         self.is_running = False
         self._user_slots = []
-        self._bot_slot = None
+        self._bot_slots = []
         self._user_ready = False
         self._bot_ready = False
         self._bot_only_warned = False
@@ -371,6 +389,7 @@ class TelegramClientManager:
         self._client_message_cache = {}  # (client_id, chat_id, message_id) -> (ts, Message)
         self._client_message_locks = {}
         self._client_flood_until = {}
+        self._client_bad_until = {}      # id(client) -> ts; skip accounts that cannot read a chat
         self._stream_cursor = 0
         self._log_cache = {}
         self._refresh_locks = {}
@@ -389,7 +408,7 @@ class TelegramClientManager:
 
     @property
     def has_bot_token(self) -> bool:
-        return self._bot_ready and self._bot_slot is not None
+        return self._bot_ready and any(slot.ready for slot in self._bot_slots)
 
     @property
     def is_bot_only(self) -> bool:
@@ -398,16 +417,19 @@ class TelegramClientManager:
     def _ready_user_slots(self) -> list:
         return [slot for slot in self._user_slots if slot.ready]
 
+    def _ready_bot_slots(self) -> list:
+        return [slot for slot in self._bot_slots if slot.ready]
+
     def _active_client(self) -> Client:
         """First ready user session (search/logs), bot token as fallback."""
         for slot in self._ready_user_slots():
             return slot.client
-        if self.has_bot_token:
-            return self._bot_slot.client
+        for slot in self._ready_bot_slots():
+            return slot.client
         raise TelegramUnavailable("Telegram client is not connected yet")
 
     def _all_ready_slots(self) -> list:
-        return self._ready_user_slots() + ([self._bot_slot] if self.has_bot_token else [])
+        return self._ready_user_slots() + self._ready_bot_slots()
 
     def _client_label(self, client: Client) -> str:
         for slot in self._all_ready_slots():
@@ -415,19 +437,36 @@ class TelegramClientManager:
                 return slot.label
         return "telegram session"
 
-    def _stream_clients(self, file_size: int = 0) -> list:
+    def _bot_can_stream_chat(self, slot, chat_id) -> bool:
+        """A bot may only carry chunks for chats it verified (admin access)."""
+        if not slot.chats_checked or chat_id is None:
+            return True
+        try:
+            return int(chat_id) in slot.chats_ok
+        except (TypeError, ValueError):
+            return chat_id in slot.chats_ok
+
+    def _stream_clients(self, file_size: int = 0, chat_id=None) -> list:
         """Return the clients that may carry stream chunks.
 
-        User sessions are preferred and can be rotated per chunk. The bot is
-        only used when no user session is available (it cannot stream big files
-        and its own download cap applies).
+        Every ready user session takes part in the chunk rotation. Bot clients
+        join it too (MTProto bots can read large files) unless
+        ``TG_BOT_STREAMING`` is off, in which case they are only a fallback
+        when no user session is available. A bot that is not a member/admin of
+        the chat being streamed is left out.
         """
         self.ensure_streamable(file_size)
-        ready = [slot.client for slot in self._ready_user_slots()]
-        if ready:
-            return ready
-        if self.has_bot_token:
-            return [self._bot_slot.client]
+        users = [slot.client for slot in self._ready_user_slots()]
+        bots = [
+            slot.client for slot in self._ready_bot_slots()
+            if self._bot_can_stream_chat(slot, chat_id)
+        ]
+        if users:
+            if Config.TG_BOT_STREAMING and bots:
+                return users + bots
+            return users
+        if bots:
+            return bots
         raise TelegramUnavailable("Telegram client is not connected yet")
 
     def ensure_streamable(self, file_size: int = 0):
@@ -436,6 +475,7 @@ class TelegramClientManager:
             return
         if not self.has_bot_token:
             raise TelegramUnavailable("Telegram client is not connected yet")
+        # Optional guard (off by default) for bot-only setups.
         limit_mb = Config.BOT_FILE_LIMIT_MB
         if limit_mb > 0 and file_size and file_size > limit_mb * CHUNK_SIZE:
             raise BotFileLimitError(file_size, limit_mb)
@@ -476,19 +516,21 @@ class TelegramClientManager:
 
         mode = Config.TG_AUTH_MODE
         sessions = Config.session_strings() if mode in ("auto", "user") else []
-        want_bot = bool(Config.BOT_TOKEN) and mode in ("auto", "bot")
+        bot_tokens = Config.bot_tokens() if mode in ("auto", "bot") else []
 
         self.user_client = None
         self.user_clients = []
         self.bot_client = None
+        self.bot_clients = []
         self._user_slots = []
-        self._bot_slot = None
+        self._bot_slots = []
         self._user_ready = False
         self._bot_ready = False
         self._bot_only_warned = False
         self._client_message_cache.clear()
         self._client_message_locks.clear()
         self._client_flood_until.clear()
+        self._client_bad_until.clear()
         self._stream_cursor = 0
 
         for index, session_string in enumerate(sessions, 1):
@@ -508,25 +550,35 @@ class TelegramClientManager:
                 _SessionSlot(client, f"user session {index}" if len(sessions) > 1 else "user session")
             )
 
-        if want_bot:
-            logger.info("Initializing Telegram bot client (bot token)...")
-            self.bot_client = self._new_client(
-                name="tg_stremio_bot",
+        for index, token in enumerate(bot_tokens, 1):
+            logger.info(
+                f"Initializing Telegram bot client {index}/{len(bot_tokens)} (bot token)..."
+            )
+            client = self._new_client(
+                name=f"tg_stremio_bot_{index}",
                 api_id=Config.API_ID,
                 api_hash=Config.API_HASH,
-                bot_token=Config.BOT_TOKEN,
+                bot_token=token,
                 in_memory=True,
                 no_updates=True,
             )
-            self._bot_slot = _SessionSlot(self.bot_client, "bot token", is_bot=True)
+            self.bot_clients.append(client)
+            self._bot_slots.append(
+                _SessionSlot(
+                    client,
+                    f"bot {index}" if len(bot_tokens) > 1 else "bot token",
+                    is_bot=True,
+                )
+            )
 
-        if not self._user_slots and not self._bot_slot:
+        if not self._user_slots and not self._bot_slots:
             raise ValueError(
                 "Neither USER_SESSION_STRING nor BOT_TOKEN is usable "
                 f"(TG_AUTH_MODE={Config.TG_AUTH_MODE})."
             )
 
         self.user_client = self.user_clients[0] if self.user_clients else None
+        self.bot_client = self.bot_clients[0] if self.bot_clients else None
         self.client = self.user_client or self.bot_client
         self._tg_semaphore = asyncio.Semaphore(Config.TG_SEARCH_CONCURRENCY)
 
@@ -550,14 +602,12 @@ class TelegramClientManager:
             return False
 
     async def start(self):
-        if not self.client and not self._user_slots and not self._bot_slot:
+        if not self.client and not self._user_slots and not self._bot_slots:
             self.initialize()
 
         if not self.is_running:
             logger.info("Starting Pyrogram client(s)...")
-            slots = list(self._user_slots)
-            if self._bot_slot is not None:
-                slots.append(self._bot_slot)
+            slots = list(self._user_slots) + list(self._bot_slots)
             results = await asyncio.gather(
                 *(self._start_one(slot) for slot in slots), return_exceptions=True
             )
@@ -567,14 +617,16 @@ class TelegramClientManager:
                     slot.ready = False
 
             self._user_ready = any(slot.ready for slot in self._user_slots)
-            self._bot_ready = bool(self._bot_slot and self._bot_slot.ready)
+            self._bot_ready = any(slot.ready for slot in self._bot_slots)
             ready_users = self._ready_user_slots()
+            ready_bots = self._ready_bot_slots()
 
             if ready_users:
                 self.user_client = ready_users[0].client
                 self.client = self.user_client
-            elif self.has_bot_token:
-                self.client = self._bot_slot.client
+            elif ready_bots:
+                self.bot_client = ready_bots[0].client
+                self.client = self.bot_client
             else:
                 self.is_running = False
                 if Config.TG_AUTH_MODE == "user":
@@ -591,10 +643,23 @@ class TelegramClientManager:
                     f"{connected}/{len(self._user_slots)} user sessions connected; "
                     "stream chunks will rotate across them."
                 )
+            if self._bot_slots:
+                logger.info(
+                    f"{len(ready_bots)}/{len(self._bot_slots)} bot clients connected"
+                    + (
+                        "; they join the stream rotation (TG_BOT_STREAMING=true)."
+                        if (ready_users and Config.TG_BOT_STREAMING)
+                        else "."
+                    )
+                )
             if self.is_bot_only:
+                limit_note = (
+                    f" and files larger than {Config.BOT_FILE_LIMIT_MB} MB are refused"
+                    if Config.BOT_FILE_LIMIT_MB > 0 else ""
+                )
                 logger.warning(
-                    "Running with BOT TOKEN only: searches are limited and files larger "
-                    f"than {Config.BOT_FILE_LIMIT_MB} MB cannot be streamed. "
+                    "Running with BOT TOKEN(s) only: channel history search is "
+                    f"unavailable to bots{limit_note}. "
                     "Add USER_SESSION_STRING for full functionality."
                 )
 
@@ -621,9 +686,19 @@ class TelegramClientManager:
             for chat_id in chat_ids:
                 try:
                     await client.get_chat(chat_id)
+                    try:
+                        slot.chats_ok.add(int(chat_id))
+                    except (TypeError, ValueError):
+                        slot.chats_ok.add(chat_id)
                 except Exception as e:
                     hint = " (bot must be an admin of the channel)" if slot.is_bot else ""
                     logger.warning(f"[{slot.label}] Failed to cache channel {chat_id}: {e}{hint}")
+            slot.chats_checked = True
+            if slot.is_bot and chat_ids and not slot.chats_ok:
+                logger.warning(
+                    f"[{slot.label}] cannot access any configured channel; "
+                    "it will not be used for streaming. Add the bot as an admin."
+                )
 
             if Config.LOG_CHANNEL_ID:
                 try:
@@ -649,12 +724,10 @@ class TelegramClientManager:
             logger.warning(f"Failed to resolve target channels on startup: {e}")
 
     async def stop(self):
-        if (not self.is_running and not self._user_slots and self._bot_slot is None):
+        if (not self.is_running and not self._user_slots and not self._bot_slots):
             return
         logger.info("Stopping Pyrogram client(s)...")
-        clients = [slot.client for slot in self._user_slots]
-        if self._bot_slot is not None:
-            clients.append(self._bot_slot.client)
+        clients = [slot.client for slot in self._user_slots + self._bot_slots]
         for client in clients:
             try:
                 await asyncio.wait_for(client.stop(), timeout=3.0)
@@ -667,11 +740,10 @@ class TelegramClientManager:
         self.is_running = False
         self._user_ready = False
         self._bot_ready = False
-        for slot in self._user_slots:
+        for slot in self._user_slots + self._bot_slots:
             slot.ready = False
-        if self._bot_slot is not None:
-            self._bot_slot.ready = False
         self._client_flood_until.clear()
+        self._client_bad_until.clear()
 
     async def reconfigure(self):
         """Restart the Telegram client after the config wizard saved new credentials."""
@@ -680,13 +752,15 @@ class TelegramClientManager:
         self.user_client = None
         self.user_clients = []
         self.bot_client = None
+        self.bot_clients = []
         self._user_slots = []
-        self._bot_slot = None
+        self._bot_slots = []
         self._search_cache.clear()
         self._message_cache.clear()
         self._client_message_cache.clear()
         self._client_message_locks.clear()
         self._client_flood_until.clear()
+        self._client_bad_until.clear()
         self._log_cache.clear()
         self._refresh_locks.clear()
         self._refresh_ts.clear()
@@ -1292,7 +1366,11 @@ class TelegramClientManager:
             state = self._state_for_client(candidate, states)
             label = self._client_label(candidate)
 
-            if has_next and self._client_flood_until.get(id(candidate), 0.0) > time.time():
+            now_ts = time.time()
+            if has_next and (
+                self._client_flood_until.get(id(candidate), 0.0) > now_ts
+                or self._client_bad_until.get(id(candidate), 0.0) > now_ts
+            ):
                 logger.info(
                     f"{label} is cooling down; trying another session for "
                     f"message {getattr(message, 'id', '?')} chunk {index}"
@@ -1319,6 +1397,20 @@ class TelegramClientManager:
                         break
                 except Exception as e:
                     last_exc = e
+                    if _is_access_error(e) and not _is_file_reference_error(e):
+                        # This account cannot read the chat (e.g. a bot that is
+                        # not an admin): park it and let another one carry on.
+                        self._client_bad_until[id(candidate)] = time.time() + 300
+                        logger.warning(
+                            f"{label} cannot read message {getattr(message, 'id', '?')}: "
+                            f"{e}; skipping it for 5 minutes"
+                        )
+                        if has_next:
+                            break
+                        raise StreamingError(
+                            f"Telegram read failed for message {getattr(message, 'id', '?')} "
+                            f"chunk {index}: {e}"
+                        )
                     if _is_file_reference_error(e):
                         state["file_id"] = None
                         try:
@@ -1415,7 +1507,8 @@ class TelegramClientManager:
             clients = [client]
             stream_offset = 0
         else:
-            clients = self._stream_clients(file_size)
+            chat_id, _ = self._message_identity(message)
+            clients = self._stream_clients(file_size, chat_id=chat_id)
             stream_offset = self._next_stream_offset(len(clients))
 
         states = {}
