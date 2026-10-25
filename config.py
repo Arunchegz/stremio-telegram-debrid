@@ -88,7 +88,7 @@ class Config:
     TG_STREAM_PREFETCH = _env_int("TG_STREAM_PREFETCH", 4)
     TG_STREAM_MAX_RETRIES = _env_int("TG_STREAM_MAX_RETRIES", 3)
     TG_STREAM_RETRY_BACKOFF = _env_float("TG_STREAM_RETRY_BACKOFF", 0.5)
-    TG_STREAM_MESSAGE_TTL = _env_int("TG_STREAM_MESSAGE_TTL", 240)  # reuse live message refs (seconds)
+    TG_STREAM_MESSAGE_TTL = _env_int("TG_STREAM_MESSAGE_TTL", 900)  # reuse live message refs (seconds); Telegram references expire in ~60 min
     # Pyrogram talks MTProto, so bots can stream large files (the 20 MB cap
     # belongs to the HTTP Bot API). Optional client-side guard for bot-only
     # setups; 0 (default) disables it.

@@ -1217,10 +1217,12 @@ class TelegramClientManager:
             except Exception as e:
                 logger.warning(f"Failed to fetch additional split parts for {base}: {e}")
 
-        # Merge and deduplicate by message ID
-        deduped = {msg.id: msg for msg in results}
+        # Merge and deduplicate by (chat_id, message_id) — message IDs are
+        # per-channel, so using msg.id alone would silently drop results when
+        # multiple channels are configured.
+        deduped = {(msg.chat.id, msg.id): msg for msg in results}
         for msg in additional_messages:
-            deduped[msg.id] = msg
+            deduped[(msg.chat.id, msg.id)] = msg
 
         final_results = list(deduped.values())
         try:
@@ -1271,6 +1273,11 @@ class TelegramClientManager:
                 newest = sorted(trimmed.items(), key=lambda item: item[1][0], reverse=True)
                 trimmed = dict(newest[:1024])
             self._client_message_cache = trimmed
+            # Prune locks that no longer correspond to active cached messages
+            active_keys = set(trimmed.keys())
+            self._client_message_locks = {
+                k: lock for k, lock in self._client_message_locks.items() if k in active_keys
+            }
 
     def _client_message_lock(self, key) -> asyncio.Lock:
         lock = self._client_message_locks.get(key)
@@ -1445,6 +1452,18 @@ class TelegramClientManager:
         if lock is None:
             lock = asyncio.Lock()
             self._refresh_locks[key] = lock
+
+            # Keep _refresh_locks bounded by pruning stale entries
+            if len(self._refresh_locks) > 512:
+                cutoff = time.time() - max(300, Config.TG_STREAM_MESSAGE_TTL * 2)
+                self._refresh_locks = {
+                    k: l for k, l in self._refresh_locks.items()
+                    if self._refresh_ts.get(k, 0) >= cutoff
+                }
+                self._refresh_ts = {
+                    k: ts for k, ts in self._refresh_ts.items()
+                    if ts >= cutoff
+                }
 
         async with lock:
             cached = self._message_cache.get(cache_key)

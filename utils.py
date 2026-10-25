@@ -144,6 +144,55 @@ def matches_subtitle(video_filename: str, sub_filename: str) -> bool:
     
     return s_base_clean in v_base or v_base in s_base_clean
 
+
+_SUB_LANG_MAP = {
+    "eng": "eng", "english": "eng", "en": "eng",
+    "spa": "spa", "spanish": "spa", "es": "spa", "esp": "spa", "castellano": "spa",
+    "fre": "fre", "french": "fre", "fr": "fre", "fra": "fre",
+    "ger": "ger", "german": "ger", "de": "ger", "deu": "ger",
+    "ita": "ita", "italian": "ita", "it": "ita",
+    "por": "por", "portuguese": "por", "pt": "por", "pob": "por",
+    "hin": "hin", "hindi": "hin", "hi": "hin",
+    "jpn": "jpn", "japanese": "jpn", "ja": "jpn",
+    "kor": "kor", "korean": "kor", "ko": "kor",
+    "chi": "chi", "chinese": "chi", "zh": "chi", "zho": "chi",
+    "ara": "ara", "arabic": "ara", "ar": "ara",
+    "rus": "rus", "russian": "rus", "ru": "rus",
+    "tur": "tur", "turkish": "tur", "tr": "tur",
+    "dut": "dut", "dutch": "dut", "nl": "dut", "nld": "dut",
+    "pol": "pol", "polish": "pol", "pl": "pol",
+    "swe": "swe", "swedish": "swe", "sv": "swe",
+    "nor": "nor", "norwegian": "nor", "no": "nor",
+    "fin": "fin", "finnish": "fin", "fi": "fin",
+    "dan": "dan", "danish": "dan", "da": "dan",
+    "tam": "tam", "tamil": "tam", "ta": "tam",
+    "tel": "tel", "telugu": "tel", "te": "tel",
+    "mal": "mal", "malayalam": "mal", "ml": "mal",
+    "ben": "ben", "bengali": "ben", "bn": "ben",
+    "ind": "ind", "indonesian": "ind", "id": "ind",
+    "tha": "tha", "thai": "tha", "th": "tha",
+    "vie": "vie", "vietnamese": "vie", "vi": "vie",
+    "ukr": "ukr", "ukrainian": "ukr", "uk": "ukr",
+    "cze": "cze", "czech": "cze", "cs": "cze", "ces": "cze",
+    "ell": "gre", "greek": "gre", "el": "gre", "gre": "gre",
+    "heb": "heb", "hebrew": "heb", "he": "heb",
+    "hun": "hun", "hungarian": "hun", "hu": "hun",
+    "rum": "rum", "romanian": "rum", "ro": "rum", "ron": "rum",
+}
+
+
+def detect_subtitle_language(filename: str) -> str:
+    """Detect ISO 639-2 language code from subtitle filename."""
+    if not filename:
+        return "eng"
+    name = re.sub(r'\.(srt|vtt|ass|ssa|sub)$', '', filename.lower())
+    # Split filename tokens by punctuation/spaces
+    tokens = [t for t in re.split(r'[\s._\-–—()\[\]{}]+', name) if t]
+    for token in reversed(tokens):
+        if token in _SUB_LANG_MAP:
+            return _SUB_LANG_MAP[token]
+    return "eng"
+
 def get_search_query_from_filename(filename: str) -> str:
     if not filename:
         return ""
@@ -233,33 +282,52 @@ def content_disposition(filename: str, inline: bool = True) -> str:
     return f"{kind}; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
 
 
-_metadata_cache = {}
+async def _get_shared_http_client() -> httpx.AsyncClient:
+    """Return the shared httpx client from metadata.py (connection reuse)."""
+    try:
+        from metadata import _get_client
+        return await _get_client()
+    except Exception:
+        # Fallback: import failed or client not ready yet
+        return httpx.AsyncClient(timeout=8.0, follow_redirects=True)
+
 
 async def get_metadata_from_cinemeta(meta_type: str, imdb_id: str) -> dict:
-    cache_key = f"{meta_type}:{imdb_id}"
-    if cache_key in _metadata_cache:
-        return _metadata_cache[cache_key]
+    cache_key = f"cinemeta:{meta_type}:{imdb_id}"
+
+    # Check persistent SQLite cache first (survives restarts, auto-expires)
+    try:
+        import cache as _cache
+        cached = _cache.cache_get("meta", cache_key)
+        if cached is not None:
+            return cached
+    except Exception:
+        pass
 
     url = f"https://v3-cinemeta.strem.io/meta/{meta_type}/{imdb_id}.json"
     logger.info(f"Fetching metadata from Cinemeta: {url}")
-    
+
     try:
-        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
-            resp = await client.get(url)
-            if resp.status_code == 200:
-                meta = resp.json().get("meta", {})
-                if meta:
-                    result = {
-                        "name": meta.get("name"),
-                        "year": meta.get("year"),
-                        "genres": meta.get("genres", []),
-                        "poster": meta.get("poster")
-                    }
-                    _metadata_cache[cache_key] = result
-                    return result
+        client = await _get_shared_http_client()
+        resp = await client.get(url)
+        if resp.status_code == 200:
+            meta = resp.json().get("meta", {})
+            if meta:
+                result = {
+                    "name": meta.get("name"),
+                    "year": meta.get("year"),
+                    "genres": meta.get("genres", []),
+                    "poster": meta.get("poster")
+                }
+                # Persist to SQLite (1-day TTL) — bounded, survives restarts
+                try:
+                    _cache.cache_set("meta", cache_key, result, ttl=86400)
+                except Exception:
+                    pass
+                return result
     except Exception as e:
         logger.error(f"Cinemeta metadata lookup failed: {e}")
-        
+
     return {}
 
 VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.ts', '.m4v')

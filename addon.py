@@ -31,6 +31,7 @@ from utils import (
     matches_episode,
     get_metadata_from_cinemeta,
     matches_subtitle,
+    detect_subtitle_language,
     get_search_query_from_filename,
     parse_split_info,
     is_video_file,
@@ -473,6 +474,27 @@ def get_manifest(api_key: str = ""):
             "configurationRequired": False
         }
     }
+
+@app.get("/health")
+async def health_check():
+    """Health status and diagnostic metrics."""
+    return {
+        "status": "ok" if tg_client_manager.is_running else "degraded",
+        "telegram": {
+            "is_running": tg_client_manager.is_running,
+            "user_sessions_connected": len(tg_client_manager._ready_user_slots()),
+            "bot_tokens_connected": len(tg_client_manager._ready_bot_slots()),
+            "bot_streaming": Config.TG_BOT_STREAMING,
+            "channels_configured": len(tg_client_manager.get_channel_ids()),
+        },
+        "cache": cache.get_stats(),
+        "streaming": {
+            "prefetch_chunks": Config.TG_STREAM_PREFETCH,
+            "message_ttl_seconds": Config.TG_STREAM_MESSAGE_TTL,
+            "max_retries": Config.TG_STREAM_MAX_RETRIES,
+        }
+    }
+
 
 @app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 async def landing(request: Request):
@@ -1527,13 +1549,7 @@ async def find_subtitles_for_video(video_filename: str, api_key: str = "", cache
         if sub_fn.lower().endswith(('.srt', '.vtt', '.ass')):
             if matches_subtitle(video_filename, sub_fn):
                 seen_msg_ids.add(msg.id)
-
-                lang = "eng"
-                sub_fn_lower = sub_fn.lower()
-                if ".spa" in sub_fn_lower or "spanish" in sub_fn_lower:
-                    lang = "spa"
-                elif ".fre" in sub_fn_lower or "french" in sub_fn_lower:
-                    lang = "fre"
+                lang = detect_subtitle_language(sub_fn)
 
                 subtitles.append({
                     "id": f"tgsub_{msg.chat.id}_{msg.id}",
