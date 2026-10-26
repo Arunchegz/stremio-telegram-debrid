@@ -2202,6 +2202,7 @@ async def tg_stream_proxy(
             raise
         except Exception as e:
             logger.error(f"Streaming error on message {message_id}: {e}")
+            raise
 
     logger.info(f"Streaming media '{filename}' (bytes {start}-{end}/{file_size}) - Status {status_code}")
 
@@ -2297,6 +2298,7 @@ async def tg_split_stream_proxy(
             raise
         except Exception as e:
             logger.error(f"Error streaming split file '{filename}': {e}")
+            raise
 
     logger.info(f"Streaming split media '{filename}' (bytes {start}-{end}/{total_size}) - Status {status_code}")
 
@@ -2423,6 +2425,7 @@ async def tg_zip_stream_proxy(
                 raise
             except Exception as e:
                 logger.error(f"Error streaming split ZIP entry '{filename}': {e}")
+                raise
 
         logger.info(f"Streaming uncompressed ZIP entry '{filename}' (raw bytes {stream_start}-{stream_end}/{total_size}) - Status {status_code}")
         return StreamingResponse(
