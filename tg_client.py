@@ -1504,7 +1504,8 @@ class TelegramClientManager:
         return b""
 
     async def _record_stream_chunk(self, client: Client, message: Message,
-                                  index: int, byte_count: int):
+                                  index: int, byte_count: int,
+                                  fetch_seconds: float):
         """Track successful chunk downloads and emit low-noise live account stats."""
         if byte_count <= 0:
             return
@@ -1528,6 +1529,7 @@ class TelegramClientManager:
                     "label": label,
                     "bytes": 0,
                     "chunks": 0,
+                    "fetch_seconds": 0.0,
                     "started": now,
                     "last_log": 0.0,
                     "last_log_bytes": 0,
@@ -1537,6 +1539,7 @@ class TelegramClientManager:
 
             stats["bytes"] += byte_count
             stats["chunks"] += 1
+            stats["fetch_seconds"] += max(0.0, fetch_seconds)
             stats["last_activity"] = now
 
             # Log the first successful chunk and then at most once every 5 seconds
@@ -1551,13 +1554,22 @@ class TelegramClientManager:
                 else:
                     interval_speed = interval_bytes / max(elapsed_since_log, 0.001) / (1024 * 1024)
                     average_speed = stats["bytes"] / max(now - stats["started"], 0.001) / (1024 * 1024)
+
+                # fetch_avg excludes time spent idle between successful chunk fetches.
+                # It is diagnostic throughput, not end-to-end client playback speed.
+                fetch_avg_speed = (
+                    stats["bytes"] / stats["fetch_seconds"] / (1024 * 1024)
+                    if stats["fetch_seconds"] > 0 else 0.0
+                )
                 logger.info(
                     f"[STREAM-STATS] account={stats['label']} chat={chat_id} "
                     f"message={message_id} chunk={index} "
                     f"total={stats['bytes'] / (1024 * 1024):.2f} MiB "
                     f"chunks={stats['chunks']} "
                     f"speed={interval_speed:.2f} MiB/s "
-                    f"avg={average_speed:.2f} MiB/s"
+                    f"avg={average_speed:.2f} MiB/s "
+                    f"fetch_avg={fetch_avg_speed:.2f} MiB/s "
+                    f"fetch_last={fetch_seconds * 1000:.0f} ms"
                 )
                 stats["last_log"] = now
                 stats["last_log_bytes"] = stats["bytes"]
@@ -1633,11 +1645,13 @@ class TelegramClientManager:
             for attempt in range(attempts):
                 try:
                     await self._ensure_stream_state(candidate, message, state, file_size)
+                    fetch_started = time.monotonic()
                     chunk = await self._fetch_chunk(
                         candidate, state["file_id"], file_size, index
                     )
+                    fetch_seconds = time.monotonic() - fetch_started
                     await self._record_stream_chunk(
-                        candidate, message, index, len(chunk)
+                        candidate, message, index, len(chunk), fetch_seconds
                     )
                     return chunk
                 except asyncio.CancelledError:
